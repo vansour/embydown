@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// 同一进程内序列化写入（TUI 登录/删除 + 后台任务可能同时保存）。
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -19,11 +23,43 @@ pub struct Profile {
     pub insecure: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// TUI「设置」页的默认值；修改后自动保存。
+    pub out: String,
+    pub connections: usize,
+    pub jobs: usize,
+    pub limit: String,
+    pub subs: bool,
+    pub overwrite: bool,
+    pub resume: bool,
+    pub pattern: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            out: "./downloads".into(),
+            connections: 8,
+            jobs: 2,
+            limit: String::new(),
+            subs: true,
+            overwrite: false,
+            resume: true,
+            pattern: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// 别名 → 服务器配置。BTreeMap 保证输出顺序稳定。
     #[serde(default)]
     pub servers: BTreeMap<String, Profile>,
+    /// TUI 下载设置（输出目录、并发、限速等），与登录信息分开保存。
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 impl Config {
@@ -108,7 +144,12 @@ pub fn path() -> Result<PathBuf> {
 /// 读取配置；文件不存在时返回 `None`（供 login 首次使用）。
 pub fn load_optional() -> Result<Option<Config>> {
     let path = path()?;
-    let text = match std::fs::read_to_string(&path) {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_from(&path)
+}
+
+fn load_from(path: &Path) -> Result<Option<Config>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("读取配置失败: {}", path.display())),
@@ -137,54 +178,126 @@ pub fn load_optional() -> Result<Option<Config>> {
             insecure: flat.insecure,
         },
     );
-    save_to(&path, &cfg)?;
+    write_atomic(path, &cfg)?;
     Ok(Some(cfg))
 }
 
-pub fn load() -> Result<Config> {
-    match load_optional()? {
-        Some(cfg) if !cfg.servers.is_empty() => Ok(cfg),
-        _ => bail!(
-            "尚未登录任何服务器；请先运行 embydown login --server <URL> --user <账号> --password <密码>"
-        ),
-    }
-}
-
-pub fn save(cfg: &Config) -> Result<PathBuf> {
+/// 原子地“读取 → 修改 → 保存”。
+///
+/// load 和 save 之间如果被另一个进程（TUI 与 CLI 同时登录/删除）插入写入，
+/// 后保存的进程会用旧快照覆盖掉对方的改动。这里同时使用进程内互斥锁和
+/// 锁文件把整个读改写过程串行化。
+pub fn edit<T>(f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
     let path = path()?;
-    save_to(&path, cfg)?;
-    Ok(path)
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
+    let _file_lock = acquire_file_lock(dir);
+    let mut cfg = load_from(&path)?.unwrap_or_default();
+    let out = f(&mut cfg)?;
+    write_atomic(&path, &cfg)?;
+    Ok(out)
 }
 
-fn save_to(path: &PathBuf, cfg: &Config) -> Result<()> {
+fn write_atomic(path: &Path, cfg: &Config) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(cfg)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("写入配置失败: {}", path.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    // 已存在的文件可能权限更宽，统一收紧到 0600
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
-    Ok(())
+    // 写临时文件 + fsync + rename：原地 truncate 时断电/磁盘满会留下
+    // 空或半截 JSON，之后所有命令（包括 login）都会“解析配置失败”。
+    let tmp = tmp_path(path);
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("写入配置失败: {}", tmp.display()))?;
+        file.write_all(text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        // 已存在的文件可能权限更宽，统一收紧到 0600
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("保存配置失败: {}", path.display()))?;
+        // 让 rename 本身也落盘（目录项）。
+        if let Some(dir) = path.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
-/// 删除整个配置文件。
-pub fn clear() -> Result<bool> {
-    let path = path()?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("删除配置失败: {}", path.display())),
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// 跨进程锁：用 `create_new` 原子创建锁文件，内容写 PID；进程崩溃后
+/// 通过 `/proc/<pid>` 判断锁是否已过期。
+struct FileLock {
+    path: Option<PathBuf>,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+fn acquire_file_lock(dir: &Path) -> FileLock {
+    let lock = dir.join(".config.json.lock");
+    // 最多等约 1.5 秒；拿不到也继续（原子 rename 仍能保证不写坏文件）。
+    for _ in 0..30 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return FileLock {
+                    path: Some(lock),
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&lock) {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    FileLock { path: None }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    // 只在有 /proc 的系统（Linux）上判断，避免在 macOS 等平台把活锁当成过期锁删掉。
+    if !Path::new("/proc").is_dir() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    !Path::new(&format!("/proc/{pid}")).exists()
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,4 +310,83 @@ struct FlatConfig {
     username: Option<String>,
     #[serde(default)]
     insecure: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn atomic_write_round_trips_and_leaves_no_temp_file() {
+        let dir = temp_dir("cfg");
+        let path = dir.join("config.json");
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "srv".into(),
+            Profile {
+                server: "http://example:8096".into(),
+                token: "secret".into(),
+                user_id: "u1".into(),
+                username: Some("alice".into()),
+                insecure: false,
+            },
+        );
+        write_atomic(&path, &cfg).unwrap();
+
+        let loaded = load_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(loaded.servers["srv"].token, "secret");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "config.json")
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件未清理: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_round_trip_and_defaults_for_legacy_config() {
+        let mut cfg = Config::default();
+        cfg.settings.out = "/media/downloads".into();
+        cfg.settings.jobs = 4;
+        cfg.settings.subs = false;
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.settings.out, "/media/downloads");
+        assert_eq!(back.settings.jobs, 4);
+        assert!(!back.settings.subs);
+
+        // 旧配置文件（只有 servers）读出来时，设置回落到默认值。
+        let legacy: Config = serde_json::from_str(r#"{"servers":{}}"#).unwrap();
+        assert_eq!(legacy.settings.out, "./downloads");
+        assert_eq!(legacy.settings.connections, 8);
+        assert!(legacy.settings.resume);
+    }
+
+    #[test]
+    fn corrupt_config_is_reported_not_silently_overwritten() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"{\"servers\":").unwrap();
+        assert!(load_from(&path).is_err());
+        // 坏文件应该保持原样，供用户手工恢复。
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"servers\":");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

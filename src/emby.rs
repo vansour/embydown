@@ -6,7 +6,7 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
-use crate::model::{AuthRequest, AuthResult, Item, MediaStream, QueryResult, TranscodeOpts, User};
+use crate::model::{AuthRequest, AuthResult, Item, MediaStream, QueryResult, User};
 use crate::util::{vlog, verbose};
 
 pub const CLIENT_NAME: &str = "embydown";
@@ -29,6 +29,9 @@ impl Client {
             .user_agent(format!("{}/{}", CLIENT_NAME, env!("CARGO_PKG_VERSION")))
             .pool_max_idle_per_host(64)
             .connect_timeout(Duration::from_secs(20))
+            // 服务端接受连接后不再发送数据时，read_timeout 会在每次读取超时后报错，
+            // 避免 probe/下载永久挂起（尤其是 TUI 里会永久占用并发槽位）。
+            .read_timeout(Duration::from_secs(60))
             .build()
             .context("构建 HTTP 客户端失败")?;
         Ok(Self {
@@ -311,10 +314,7 @@ impl Client {
     }
 
     /// 直链候选列表：优先静态直链（对非管理员账号权限要求最低），再回退官方 Download。
-    pub fn media_urls(&self, item: &Item, transcode: Option<&TranscodeOpts>) -> Vec<String> {
-        if let Some(t) = transcode {
-            return vec![self.transcode_url(item, t)];
-        }
+    pub fn media_urls(&self, item: &Item) -> Vec<String> {
         let ms_id = item.media_source_id().unwrap_or_default().to_string();
         let mut common: Vec<(&str, String)> = vec![("static", "true".to_string())];
         if !ms_id.is_empty() {
@@ -332,37 +332,17 @@ impl Client {
                 ));
             }
         }
-        // 回退 1：官方下载接口
-        urls.push(self.build_url(&format!("/Items/{}/Download", item.id), &[]));
-        // 回退 2：原文件接口（部分版本/权限下可用）
-        urls.push(self.build_url(&format!("/Items/{}/File", item.id), &[]));
+        // 回退接口（/Items/{id}/Download、/Items/{id}/File）无法指定媒体源，
+        // 锁定某个版本后它们只会返回服务器的默认源。宁可报错，也不能把
+        // “错误的文件”存成用户选中的版本。
+        if !item.source_locked {
+            // 回退 1：官方下载接口
+            urls.push(self.build_url(&format!("/Items/{}/Download", item.id), &[]));
+            // 回退 2：原文件接口（部分版本/权限下可用）
+            urls.push(self.build_url(&format!("/Items/{}/File", item.id), &[]));
+        }
         urls.dedup();
         urls
-    }
-
-    pub fn transcode_url(&self, item: &Item, t: &TranscodeOpts) -> String {
-        let ext = if t.container.is_empty() { "mp4" } else { &t.container };
-        let mut q: Vec<(&str, String)> = vec![
-            ("static", "false".to_string()),
-            ("Container", ext.to_string()),
-        ];
-        if let Some(c) = &t.video_codec {
-            q.push(("VideoCodec", c.clone()));
-        }
-        if let Some(c) = &t.audio_codec {
-            q.push(("AudioCodec", c.clone()));
-        }
-        if let Some(h) = t.max_height {
-            q.push(("MaxHeight", h.to_string()));
-        }
-        if let Some(b) = t.video_bitrate {
-            q.push(("VideoBitrate", b.to_string()));
-        }
-        if let Some(b) = t.audio_bitrate {
-            q.push(("AudioBitrate", b.to_string()));
-        }
-        let path = format!("/Videos/{}/stream.{}", item.id, ext);
-        self.build_url(&path, &q)
     }
 
     /// 外挂字幕候选 URL（先试 DeliveryUrl，再按 API 规则构造）。
@@ -380,7 +360,9 @@ impl Client {
             ));
         }
         let idx = stream.index.unwrap_or(0);
-        let codec = stream.codec.clone().unwrap_or_else(|| "srt".into());
+        // 用标准字幕后缀构造 URL：codec 常是 `subrip`，直接当扩展名会生成
+        // 无法被播放器/扫描器识别的 `.subrip` 文件。
+        let codec = crate::naming::subtitle_ext(stream.codec.as_deref());
         if let Some(ms) = item.media_source_id() {
             out.push(self.build_url(
                 &format!("/Videos/{}/{}/Subtitles/{}/Stream.{}", item.id, ms, idx, codec),
@@ -442,7 +424,36 @@ pub fn redact(url: &str) -> String {
             }
             u.to_string()
         }
-        Err(_) => url.to_string(),
+        Err(_) => redact_text(url),
+    }
+}
+
+/// 对任意文本（错误链、日志）脱敏。
+///
+/// `reqwest::Error` 的 Display 会带上完整请求 URL，直接打印 `{e:#}` 会把
+/// `api_key` 泄漏到终端/CI 日志里；所有面向用户的错误输出都应先过这里。
+pub fn redact_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let next = ["api_key=", "token="]
+            .iter()
+            .filter_map(|needle| lower.find(needle).map(|p| (p, needle.len())))
+            .min_by_key(|(p, _)| *p);
+        let Some((pos, len)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..pos + len]);
+        out.push_str("***");
+        let after = &rest[pos + len..];
+        let end = after
+            .find(|c: char| {
+                c == '&' || c == '#' || c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>' | ']')
+            })
+            .unwrap_or(after.len());
+        rest = &after[end..];
     }
 }
 
@@ -453,5 +464,58 @@ fn snippet(text: &str) -> String {
         t.to_string()
     } else {
         format!("{}…", t.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::MediaSource;
+
+    fn item(locked: bool) -> Item {
+        Item {
+            id: "v1".into(),
+            item_type: Some("Movie".into()),
+            container: Some("mkv".into()),
+            media_sources: Some(vec![MediaSource {
+                id: Some("ms1".into()),
+                ..Default::default()
+            }]),
+            version: locked.then(|| "1080p".to_string()),
+            source_locked: locked,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn redact_text_masks_query_credentials() {
+        let text =
+            "error sending request for url (http://h/Videos/1/stream?static=true&api_key=SECRET)";
+        let out = redact_text(text);
+        assert!(!out.contains("SECRET"), "{out}");
+        assert!(out.contains("api_key=***"), "{out}");
+        assert!(
+            redact_text("X-Emby-Token=abcd&x=1")
+                .to_ascii_lowercase()
+                .contains("token=***")
+        );
+    }
+
+    #[test]
+    fn version_blind_fallbacks_are_omitted_when_a_source_is_locked() {
+        let client = Client::new("http://127.0.0.1:8096", false).unwrap();
+
+        let urls = client.media_urls(&item(false));
+        assert!(urls.iter().any(|u| u.contains("/Items/v1/Download")));
+        assert!(urls.iter().any(|u| u.contains("/Items/v1/File")));
+        assert!(
+            urls.iter()
+                .all(|u| u.contains("/Items/v1/") || u.contains("MediaSourceId=ms1"))
+        );
+
+        let urls = client.media_urls(&item(true));
+        assert!(!urls.iter().any(|u| u.contains("/Items/v1/Download")));
+        assert!(!urls.iter().any(|u| u.contains("/Items/v1/File")));
+        assert!(urls.iter().all(|u| u.contains("MediaSourceId=ms1")));
     }
 }

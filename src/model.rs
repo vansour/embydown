@@ -42,6 +42,10 @@ pub struct Item {
     /// 非 API 字段：本次下载里同一条目存在多个版本，需要把版本名放进目录避免覆盖
     #[serde(skip)]
     pub version_scoped: bool,
+    /// 非 API 字段：该条目原本有多个媒体源，已锁定其中某一个。
+    /// 锁定后不能再使用 `/Items/{id}/Download` 这类无法指定媒体源的接口。
+    #[serde(skip)]
+    pub source_locked: bool,
 }
 
 impl Item {
@@ -262,17 +266,6 @@ impl AuthRequest {
             pw: pw.into(),
         }
     }
-}
-
-/// 播放/转码参数（`--transcode` 时才使用）。
-#[derive(Debug, Clone, Default)]
-pub struct TranscodeOpts {
-    pub container: String,
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub max_height: Option<u32>,
-    pub video_bitrate: Option<u32>,
-    pub audio_bitrate: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

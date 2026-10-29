@@ -12,22 +12,86 @@ use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 use crate::emby::{self, Client};
-use crate::model::{Item, Probe, TranscodeOpts};
+use crate::model::{Item, Probe};
 use crate::naming;
 use crate::util::{format_bytes, sanitize_component, vlog};
 
 /// 小于这个大小就不分块了（分块开销不值）。
 const MIN_CHUNK: u64 = 4 * 1024 * 1024;
 const MAX_RETRY: u32 = 3;
+
+/// 把 reqwest 错误转成脱敏后的 anyhow 错误。
+///
+/// `reqwest::Error` 的 Display 会带完整 URL（含 `api_key`），直接进 anyhow
+/// 错误链后 `{e:#}` 会把 token 打到终端和 CI 日志里。
+fn net_error(context: &str, e: reqwest::Error) -> anyhow::Error {
+    anyhow!("{}: {}", context, emby::redact_text(&e.to_string()))
+}
+
+/// 轮询取消标记。配合 `tokio::select!` 让挂起的网络调用也能被中断，
+/// 不必等到下一个数据块到达。
+async fn wait_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 服务器返回网页/JSON/XML 时几乎一定是登录页或错误页，不能当媒体下载。
+fn html_like(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let ct = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())?
+        .trim()
+        .to_string();
+    let lower = ct.to_ascii_lowercase();
+    let bad = lower.starts_with("text/html")
+        || lower.starts_with("application/json")
+        || lower.starts_with("text/xml")
+        || lower.starts_with("application/xml");
+    bad.then_some(ct)
+}
+
+/// 目标路径锁：同一个目标文件（以及它的 `.part` / `.part.json`）同一时刻只允许
+/// 一个下载任务写入。不同服务器队列可能解析到同一路径，并发写入会得到混合文件。
+static DEST_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn dest_lock(path: &Path) -> Arc<Mutex<()>> {
+    let key = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let map = DEST_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 64 {
+        // 清理已经没人持有的路径锁，避免长时间运行的 TUI 无限增长。
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn lock_dest(path: &Path) -> OwnedMutexGuard<()> {
+    dest_lock(path).lock_owned().await
+}
+
+/// 等待目标锁期间也响应取消，避免一个卡住的任务把同路径的后续任务也拖死。
+async fn lock_dest_cancellable(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Option<OwnedMutexGuard<()>> {
+    tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel) => None,
+        guard = lock_dest(path) => Some(guard),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DownloadOpts {
@@ -40,7 +104,6 @@ pub struct DownloadOpts {
     pub overwrite: bool,
     pub subs: bool,
     pub dry_run: bool,
-    pub transcode: Option<TranscodeOpts>,
 }
 
 impl Default for DownloadOpts {
@@ -55,7 +118,6 @@ impl Default for DownloadOpts {
             overwrite: false,
             subs: true,
             dry_run: false,
-            transcode: None,
         }
     }
 }
@@ -97,6 +159,8 @@ pub struct Limiter {
 
 impl Limiter {
     pub fn new(rate: Option<u64>) -> Self {
+        // 0 会让 expected=bytes/0=inf，Duration::from_secs_f64 直接 panic。
+        let rate = rate.filter(|r| *r > 0);
         Self {
             rate,
             inner: Mutex::new(Throttle {
@@ -140,9 +204,10 @@ impl Limiter {
         let mut g = self.inner.lock().await;
         g.bytes += n;
         let elapsed = g.start.elapsed().as_secs_f64();
-        let expected = g.bytes as f64 / rate as f64;
+        let expected = g.bytes as f64 / rate.max(1) as f64;
         if expected > elapsed {
-            Duration::from_secs_f64(expected - elapsed)
+            // 上限防止异常输入产生超大/非有限等待时间。
+            Duration::from_secs_f64((expected - elapsed).min(3600.0))
         } else {
             if elapsed > 10.0 {
                 g.start = Instant::now();
@@ -155,8 +220,14 @@ impl Limiter {
 
 // ───────────────────────── 断点状态 ─────────────────────────
 
+/// 断点状态文件格式版本。旧版本（或未来无法理解的版本）一律不复用，
+/// 宁可重新下载，也不能信任来历不明的完成记录。
+const STATE_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PartState {
+    #[serde(default)]
+    version: u32,
     total: u64,
     chunk_size: u64,
     completed: Vec<u32>,
@@ -179,8 +250,14 @@ pub async fn probe(http: &reqwest::Client, url: &str) -> Result<Probe> {
         .header(RANGE, "bytes=0-0")
         .send()
         .await
-        .with_context(|| format!("连接直链失败: {}", emby::redact(url)))?;
+        .map_err(|e| net_error("连接直链失败", e))?;
     let status = resp.status();
+    // 只有 2xx 才可能是“成功返回的网页”；401/403 等保留更具体的错误提示。
+    if status.is_success()
+        && let Some(ct) = html_like(resp.headers())
+    {
+        bail!("服务器返回的是网页/错误页（Content-Type: {ct}），不是媒体文件");
+    }
     match status.as_u16() {
         206 => {
             let total = resp
@@ -247,7 +324,12 @@ async fn download_file(
     let mut used_url = String::new();
     let mut last_err: Option<anyhow::Error> = None;
     for url in candidates {
-        match probe(http, url).await {
+        let probed = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
+            r = probe(http, url) => r,
+        };
+        match probed {
             Ok(p) => {
                 vlog(2, format!("  ↳ 直链可用: {}", emby::redact(url)));
                 used_url = url.clone();
@@ -255,7 +337,14 @@ async fn download_file(
                 break;
             }
             Err(e) => {
-                vlog(2, format!("  ↳ 直链不可用: {} ({})", emby::redact(url), e));
+                vlog(
+                    2,
+                    format!(
+                        "  ↳ 直链不可用: {} ({})",
+                        emby::redact(url),
+                        emby::redact_text(&e.to_string())
+                    ),
+                );
                 last_err = Some(e);
             }
         }
@@ -293,21 +382,38 @@ async fn download_file(
             http,
             &used_url,
             &part,
+            &state_file,
             total,
             pb,
             limiter,
             cancel.as_ref(),
-            opts.resume,
+            // --overwrite 的语义是“重新下载”，不能复用旧的 .part 分块。
+            opts.resume && !opts.overwrite,
             probe.range_supported,
         )
         .await?
     };
 
+    // 用户取消时绝不能把半成品 rename 成正式文件。
+    if cancel.load(Ordering::SeqCst) {
+        return Err(anyhow::Error::new(Cancelled));
+    }
+
     if let Some(t) = total {
+        // 分块模式已逐块校验；单连接模式在这里校验实际写入量。
+        // 注意：不能只看 .part 的 length——分块模式会 set_len 预分配，
+        // 长度天然等于 total，那个检查本身说明不了任何问题。
+        if written != t {
+            bail!(
+                "文件大小不符：期望 {} 字节，实际 {} 字节（保留 .part 便于续传）",
+                t,
+                written
+            );
+        }
         let meta = tokio::fs::metadata(&part).await.context("读取临时文件失败")?;
         if meta.len() != t {
             bail!(
-                "文件大小不符：期望 {} 字节，实际 {} 字节（保留 .part 便于续传）",
+                "临时文件大小不符：期望 {} 字节，实际 {} 字节（保留 .part 便于续传）",
                 t,
                 meta.len()
             );
@@ -342,32 +448,55 @@ async fn download_chunked(
     let chunk_size = total.div_ceil(target_chunks).max(MIN_CHUNK);
     let count = total.div_ceil(chunk_size);
 
-    // 续传：状态文件与 part 都对得上才复用
+    // 取消发生在任何块开始之前：此时 .part 还是零填充的预分配文件，
+    // 绝不能继续走下去，否则长度校验会“通过”并把空文件 rename 成正式文件。
+    if cancel.load(Ordering::SeqCst) {
+        return Err(anyhow::Error::new(Cancelled));
+    }
+
+    // 续传：状态文件、part 长度、块布局都对得上才复用。
+    //
+    // 只信任 .part.json 是不安全的：例如 `-c 1` 重试会 File::create 截断
+    // .part，但旧状态文件仍在；下一次 `-c 8` 会跳过“已完成”块，
+    // set_len 把缺口补成零，长度校验却天然通过。
+    let part_len = tokio::fs::metadata(part).await.map(|m| m.len()).ok();
     let mut completed: HashSet<u32> = HashSet::new();
+    let mut resuming = false;
     if opts.resume
-        && part.exists()
+        && !opts.overwrite
+        && part_len == Some(total)
         && let Ok(text) = tokio::fs::read_to_string(state_file).await
         && let Ok(st) = serde_json::from_str::<PartState>(&text)
+        && st.version == STATE_VERSION
         && st.total == total
         && st.chunk_size == chunk_size
     {
-        completed = st.completed.into_iter().filter(|i| *i < count as u32).collect();
+        completed = st
+            .completed
+            .into_iter()
+            .filter(|i| *i < count as u32)
+            .collect();
+        resuming = true;
         vlog(
             1,
             format!(
                 "  ↳ 续传：已有 {}/{} 块（{}）",
                 completed.len(),
                 count,
-                format_bytes(chunk_size * completed.len() as u64)
+                format_bytes(chunk_range_len(chunk_size, total, &completed))
             ),
         );
     }
+    if !resuming {
+        // 重新开始时清掉旧状态，避免中途中断后旧状态被误用。
+        tokio::fs::remove_file(state_file).await.ok();
+    }
 
-    // 预分配并保留已下载内容
+    // 预分配；重新开始时先截断，避免残留旧字节。
     {
         let f = tokio::fs::OpenOptions::new()
             .create(true)
-            .truncate(false)
+            .truncate(!resuming)
             .write(true)
             .open(part)
             .await
@@ -375,7 +504,7 @@ async fn download_chunked(
         f.set_len(total).await.context("预分配文件大小失败")?;
     }
 
-    pb.set_position(completed.iter().map(|_| chunk_size).sum::<u64>().min(total));
+    pb.set_position(chunk_range_len(chunk_size, total, &completed));
     let done = Arc::new(Mutex::new(completed));
     let sem = Arc::new(Semaphore::new(opts.connections.max(1)));
     let mut set = tokio::task::JoinSet::new();
@@ -392,9 +521,12 @@ async fn download_chunked(
         if cancel.load(Ordering::SeqCst) {
             break;
         }
-        let start = idx * chunk_size;
-        let end = (start + chunk_size).min(total) - 1;
-        let permit = sem.clone().acquire_owned().await.context("并发控制失败")?;
+        let (start, end) = chunk_range(idx, chunk_size, total);
+        let permit = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => break,
+            p = sem.clone().acquire_owned() => p.context("并发控制失败")?,
+        };
         let http = http.clone();
         let url = url.to_string();
         let part = part.to_path_buf();
@@ -411,14 +543,15 @@ async fn download_chunked(
             fetch_chunk(&http, &url, start, end, &part, &pb, &limiter, &cancel).await?;
             let mut g = done.lock().await;
             g.insert(idx as u32);
-            // 记状态（体积很小，直接覆盖写）
+            // 记状态（体积很小，先写临时文件再 rename，避免半截 JSON）
             let st = PartState {
+                version: STATE_VERSION,
                 total: total_copy,
                 chunk_size: chunk_size_copy,
                 completed: g.iter().copied().collect(),
             };
             if let Ok(json) = serde_json::to_vec(&st) {
-                let _ = tokio::fs::write(&state_file, json).await;
+                write_state(&state_file, &json).await;
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -438,7 +571,14 @@ async fn download_chunked(
         }
     }
 
-    if cancelled {
+    let finished = done.lock().await.len();
+    // 全部块都确认完成后才算成功：不能只依赖 .part 的长度，
+    // 分块模式会 set_len 预分配，长度天然等于 total。
+    if finished == count as usize && errors.is_empty() {
+        pb.set_position(total);
+        return Ok(total);
+    }
+    if cancelled || cancel.load(Ordering::SeqCst) {
         return Err(anyhow::Error::new(Cancelled));
     }
     if !errors.is_empty() {
@@ -448,11 +588,45 @@ async fn download_chunked(
             errors.join(" | ")
         );
     }
+    bail!(
+        "仅完成 {finished}/{} 个分块（.part 与状态已保留，可直接重试续传）",
+        count
+    );
+}
 
-    let finished: u64 = done.lock().await.iter().map(|_| chunk_size).sum::<u64>().min(total);
-    // 进度条按实际写入量校正
-    pb.set_position(finished);
-    Ok(total)
+/// 分块 `idx` 的字节区间（闭区间）。
+fn chunk_range(idx: u64, chunk_size: u64, total: u64) -> (u64, u64) {
+    let start = idx.saturating_mul(chunk_size);
+    let end = (start + chunk_size).min(total).saturating_sub(1);
+    (start, end)
+}
+
+fn chunk_range_len(chunk_size: u64, total: u64, completed: &HashSet<u32>) -> u64 {
+    completed
+        .iter()
+        .map(|i| {
+            let (start, end) = chunk_range(*i as u64, chunk_size, total);
+            end.saturating_sub(start) + 1
+        })
+        .sum::<u64>()
+        .min(total)
+}
+
+/// 原子写状态文件。数据块在 fetch_chunk_once 里已 fsync，
+/// 状态文件本身也 fsync 后再 rename：只有数据真正落盘的分块才会被记录，
+/// 避免断电后状态声称“已完成”但 .part 里是零。
+async fn write_state(state_file: &Path, json: &[u8]) {
+    let tmp = state_file.with_extension("json.tmp");
+    let Ok(mut f) = tokio::fs::File::create(&tmp).await else {
+        return;
+    };
+    if f.write_all(json).await.is_err() || f.sync_all().await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return;
+    }
+    drop(f);
+    // rename 失败时旧的（更保守的）状态仍然有效，最多多下一块。
+    let _ = tokio::fs::rename(&tmp, state_file).await;
 }
 
 /// 下载单个块（带退避重试，失败回退进度）。
@@ -507,13 +681,35 @@ async fn fetch_chunk_once(
     limiter: &Limiter,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let resp = http
+    let req = http
         .get(url)
-        .header(RANGE, format!("bytes={start}-{end}"))
-        .send()
-        .await?;
+        .header(RANGE, format!("bytes={start}-{end}"));
+    let resp = tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
+        r = req.send() => r.map_err(|e| net_error("建立下载连接失败", e))?,
+    };
     if resp.status().as_u16() != 206 {
         bail!("期望 206，实际 HTTP {}", resp.status().as_u16());
+    }
+    if let Some(ct) = html_like(resp.headers()) {
+        bail!("服务器返回的是网页/错误页（Content-Type: {ct}），不是媒体文件");
+    }
+    // 校验 Content-Range 的起点，避免服务器返回了错误的区间却长度相同。
+    if let Some(cr) = resp
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        let actual_start = cr
+            .trim()
+            .strip_prefix("bytes")
+            .map(str::trim)
+            .and_then(|s| s.split_once('-'))
+            .and_then(|(a, _)| a.trim().parse::<u64>().ok());
+        if actual_start != Some(start) {
+            bail!("服务器返回的 Range 不正确：请求 {start}-{end}，实际 {cr}");
+        }
     }
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -524,11 +720,16 @@ async fn fetch_chunk_once(
 
     let mut written: u64 = 0;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.load(Ordering::SeqCst) {
-            file.flush().await.ok();
-            return Err(anyhow::Error::new(Cancelled));
-        }
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => {
+                file.flush().await.ok();
+                return Err(anyhow::Error::new(Cancelled));
+            }
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
         match chunk {
             Ok(bytes) => {
                 file.write_all(&bytes).await.context("写盘失败（磁盘满？）")?;
@@ -543,7 +744,7 @@ async fn fetch_chunk_once(
             }
             Err(e) => {
                 pb.dec(written);
-                return Err(anyhow!("传输中断: {e}"));
+                return Err(net_error("传输中断", e));
             }
         }
     }
@@ -553,6 +754,8 @@ async fn fetch_chunk_once(
         pb.dec(written);
         bail!("块长度不符：期望 {expected}，实际 {written}");
     }
+    // 先让数据落盘，之后才允许把该块记入状态文件。
+    file.sync_data().await.context("同步磁盘失败（磁盘满？）")?;
     Ok(())
 }
 
@@ -564,6 +767,7 @@ async fn download_single(
     http: &reqwest::Client,
     url: &str,
     part: &Path,
+    state_file: &Path,
     total: Option<u64>,
     pb: &ProgressBar,
     limiter: &Limiter,
@@ -585,18 +789,25 @@ async fn download_single(
     if start > 0 {
         req = req.header(RANGE, format!("bytes={start}-"));
     }
-    let resp = req.send().await.context("建立下载连接失败")?;
+    let resp = tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
+        r = req.send() => r.map_err(|e| net_error("建立下载连接失败", e))?,
+    };
     let code = resp.status().as_u16();
     if start > 0 && code != 206 {
         // 服务器没按 Range 回包，只能重头来
         vlog(1, format!("  ↳ 服务器未按 Range 响应（HTTP {code}），从头下载"));
         return Box::pin(download_single(
-            http, url, part, total, pb, limiter, cancel, false, false,
+            http, url, part, state_file, total, pb, limiter, cancel, false, false,
         ))
         .await;
     }
     if code != 200 && code != 206 {
         bail!("下载失败：HTTP {code}");
+    }
+    if let Some(ct) = html_like(resp.headers()) {
+        bail!("服务器返回的是网页/错误页（Content-Type: {ct}），不是媒体文件");
     }
     if start > 0 {
         vlog(1, format!("  ↳ 单连接续传：从 {} 继续", crate::util::format_bytes(start)));
@@ -610,6 +821,8 @@ async fn download_single(
             .await
             .with_context(|| format!("打开临时文件失败: {}", part.display()))?
     } else {
+        // 从头下载：清掉可能残留的分块状态，避免下次分块运行时被误用。
+        tokio::fs::remove_file(state_file).await.ok();
         tokio::fs::File::create(part)
             .await
             .with_context(|| format!("创建临时文件失败: {}", part.display()))?
@@ -621,12 +834,17 @@ async fn download_single(
 
     let mut written: u64 = 0;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.load(Ordering::SeqCst) {
-            file.flush().await.ok();
-            return Err(anyhow::Error::new(Cancelled));
-        }
-        let bytes = chunk.context("传输中断")?;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => {
+                file.flush().await.ok();
+                return Err(anyhow::Error::new(Cancelled));
+            }
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
+        let bytes = chunk.map_err(|e| net_error("传输中断", e))?;
         file.write_all(&bytes).await.context("写盘失败（磁盘满？）")?;
         written += bytes.len() as u64;
         pb.inc(bytes.len() as u64);
@@ -639,6 +857,15 @@ async fn download_single(
         }
     }
     file.flush().await.ok();
+    if let Some(t) = total
+        && start + written != t
+    {
+        bail!(
+            "文件大小不符：期望 {} 字节，实际 {} 字节（保留 .part 便于续传）",
+            t,
+            start + written
+        );
+    }
     Ok(start + written)
 }
 
@@ -654,31 +881,74 @@ async fn download_subs(
     cancel: &AtomicBool,
     overwrite: bool,
 ) -> usize {
-    let streams: Vec<&crate::model::MediaStream> = item
-        .media_streams
-        .iter()
-        .flatten()
-        .chain(
-            item.media_sources
-                .iter()
-                .flatten()
-                .flat_map(|ms| ms.media_streams.iter().flatten()),
-        )
-        .filter(|s| {
-            s.stream_type.as_deref() == Some("Subtitle") && s.is_external.unwrap_or(false)
-        })
-        .collect();
+    let streams: Vec<&crate::model::MediaStream> = {
+        // item 级别的 MediaStreams 常与第一个 MediaSource 的流重复；
+        // 不去重会让同一语言的字幕被误判成多条轨道。
+        let mut seen = HashSet::new();
+        item.media_streams
+            .iter()
+            .flatten()
+            .chain(
+                item.media_sources
+                    .iter()
+                    .flatten()
+                    .flat_map(|ms| ms.media_streams.iter().flatten()),
+            )
+            .filter(|s| {
+                s.stream_type.as_deref() == Some("Subtitle") && s.is_external.unwrap_or(false)
+            })
+            .filter(|s| {
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    s.index.unwrap_or(-1),
+                    s.language.as_deref().unwrap_or(""),
+                    s.codec.as_deref().unwrap_or(""),
+                    s.delivery_url.as_deref().unwrap_or("")
+                );
+                seen.insert(key)
+            })
+            .collect()
+    };
 
     if streams.is_empty() {
         return 0;
     }
+    // 同一语言（含 forced）可能有多条轨道（简体/繁体/SDH），
+    // 直接按语言命名会让后一条跳过或覆盖前一条。
+    let mut group_counts: HashMap<(String, bool), usize> = HashMap::new();
+    for s in &streams {
+        let key = (
+            s.language
+                .clone()
+                .unwrap_or_else(|| "und".into())
+                .trim()
+                .to_lowercase(),
+            s.is_forced.unwrap_or(false),
+        );
+        *group_counts.entry(key).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<(String, bool), usize> = HashMap::new();
     let http = client.http.clone();
     let mut ok = 0usize;
     for s in streams {
         let lang = s.language.clone().unwrap_or_else(|| "und".into());
-        let ext = s.codec.clone().unwrap_or_else(|| "srt".into());
+        let ext = naming::subtitle_ext(s.codec.as_deref());
         let forced = s.is_forced.unwrap_or(false);
-        let rel = naming::subtitle_path(video_rel, &lang, &ext, forced);
+        let key = (lang.trim().to_lowercase(), forced);
+        let nth = {
+            let n = seen.entry(key.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let disambiguator = (group_counts.get(&key).copied().unwrap_or(0) > 1)
+            .then(|| nth.to_string());
+        let rel = naming::subtitle_path(
+            video_rel,
+            &lang,
+            &ext,
+            forced,
+            disambiguator.as_deref(),
+        );
         let file_name = Path::new(&rel)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -699,7 +969,13 @@ async fn download_subs(
                     break;
                 }
                 Ok(false) => continue,
-                Err(e) => vlog(2, format!("  ↳ 字幕下载失败: {e}")),
+                Err(e) => vlog(
+                    2,
+                    format!(
+                        "  ↳ 字幕下载失败: {}",
+                        emby::redact_text(&format!("{e}"))
+                    ),
+                ),
             }
             limiter.acquire(1024).await;
         }
@@ -715,22 +991,23 @@ async fn download_subs(
 
 /// 小文件下载：返回 true 表示保存成功。
 async fn fetch_small(http: &reqwest::Client, url: &str, dest: &Path) -> Result<bool> {
-    let resp = http.get(url).send().await?;
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| net_error("字幕连接失败", e))?;
     let status = resp.status();
     if status.as_u16() != 200 && status.as_u16() != 206 {
         return Ok(false);
     }
-    let ctype = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    // 服务器报错常返回 HTML，别把 404 页面存成字幕
-    if ctype.contains("text/html") {
+    // 服务器报错常返回 HTML/JSON，别把错误页存成字幕
+    if html_like(resp.headers()).is_some() {
         return Ok(false);
     }
-    let bytes = resp.bytes().await?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| net_error("读取字幕失败", e))?;
     if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
         return Ok(false);
     }
@@ -830,7 +1107,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
             if opts.dry_run {
                 let urls = match &item.direct_url {
                     Some(u) => vec![u.clone()],
-                    None => client.media_urls(&item, opts.transcode.as_ref()),
+                    None => client.media_urls(&item),
                 };
                 println!("📄 {rel}");
                 println!("   → {}", dest.display());
@@ -839,6 +1116,12 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
                 }
                 return TaskResult::Skipped;
             }
+
+            // 同一目标路径的任务必须串行：不同服务器/重复条目可能解析到
+            // 同一个文件，并发写 .part 会得到混合内容。
+            let Some(_dest_guard) = lock_dest_cancellable(&dest, &cancel).await else {
+                return TaskResult::Cancelled;
+            };
 
             // 已完整存在则跳过
             if dest.exists() && !opts.overwrite {
@@ -858,7 +1141,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
             pb.set_message(shorten(&label, 56));
             let urls = match &item.direct_url {
                 Some(u) => vec![u.clone()],
-                None => client.media_urls(&item, opts.transcode.as_ref()),
+                None => client.media_urls(&item),
             };
 
             let started = Instant::now();
@@ -906,7 +1189,10 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
                 }
                 Err(e) => {
                     pb.finish_and_clear();
-                    eprintln!("❌ {rel}\n   {e:#}");
+                    eprintln!(
+                        "❌ {rel}\n   {}",
+                        emby::redact_text(&format!("{e:#}"))
+                    );
                     fail_streak.fetch_add(1, Ordering::SeqCst);
                     TaskResult::Failed
                 }
@@ -982,6 +1268,11 @@ pub async fn download_one(
     );
     let dest = opts.out.join(&rel);
 
+    // 与 CLI 路径一致：同一目标路径串行，避免并发写同一个 .part。
+    let Some(_dest_guard) = lock_dest_cancellable(&dest, cancel).await else {
+        return Err(anyhow::Error::new(Cancelled));
+    };
+
     // 已完整存在则跳过
     if dest.exists() && !opts.overwrite {
         let existing = tokio::fs::metadata(&dest).await.map(|m| m.len()).ok();
@@ -1002,7 +1293,7 @@ pub async fn download_one(
 
     let urls = match &item.direct_url {
         Some(u) => vec![u.clone()],
-        None => client.media_urls(item, opts.transcode.as_ref()),
+        None => client.media_urls(item),
     };
     pb.set_message(item.title());
     let bytes = download_file(&client.http, &urls, &dest, pb, opts, limiter, cancel).await?;
@@ -1030,5 +1321,35 @@ fn shorten(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("…{}", s.chars().skip(s.chars().count() - max + 1).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_ranges_cover_the_file_exactly() {
+        let total = 9u64;
+        let chunk = 4u64;
+        let count = total.div_ceil(chunk);
+        let mut covered = 0;
+        for idx in 0..count {
+            let (start, end) = chunk_range(idx, chunk, total);
+            assert_eq!(start, idx * chunk);
+            assert!(end >= start);
+            assert!(end < total);
+            covered += end - start + 1;
+        }
+        assert_eq!(covered, total);
+    }
+
+    #[test]
+    fn chunk_range_len_uses_real_length_of_short_last_chunk() {
+        // total=9, chunk=4 → 4 + 4 + 1
+        let completed: HashSet<u32> = [0, 2].into_iter().collect();
+        assert_eq!(chunk_range_len(4, 9, &completed), 5);
+        let all: HashSet<u32> = [0, 1, 2].into_iter().collect();
+        assert_eq!(chunk_range_len(4, 9, &all), 9);
     }
 }

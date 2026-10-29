@@ -31,7 +31,7 @@ async fn main() {
     let cli = Cli::parse();
     util::set_verbose(cli.verbose);
     if let Err(err) = run(cli).await {
-        eprintln!("\n❌ {err:#}");
+        eprintln!("\n❌ {}", crate::emby::redact_text(&format!("{err:#}")));
         std::process::exit(1);
     }
 }
@@ -75,18 +75,18 @@ async fn login(args: LoginArgs) -> Result<()> {
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| config::name_from_server(&client.server));
 
-    let mut cfg = config::load_optional()?.unwrap_or_default();
-    let replaced = cfg.servers.insert(
-        name.clone(),
-        Profile {
-            server: client.server.clone(),
-            token: client.token.clone(),
-            user_id: client.user_id.clone(),
-            username: username.clone(),
-            insecure: args.insecure,
-        },
-    );
-    let path = config::save(&cfg)?;
+    let profile = Profile {
+        server: client.server.clone(),
+        token: client.token.clone(),
+        user_id: client.user_id.clone(),
+        username: username.clone(),
+        insecure: args.insecure,
+    };
+    let (replaced, count) = config::edit(|cfg| {
+        let replaced = cfg.servers.insert(name.clone(), profile);
+        Ok((replaced, cfg.servers.len()))
+    })?;
+    let path = config::path()?;
 
     if let Some(old) = replaced
         && old.server != client.server
@@ -100,7 +100,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     println!(
         "📝 登录信息已保存到 {}（共 {} 个服务器）",
         path.display(),
-        cfg.servers.len()
+        count
     );
     Ok(())
 }
@@ -108,24 +108,32 @@ async fn login(args: LoginArgs) -> Result<()> {
 fn logout(name: Option<String>) -> Result<()> {
     match name {
         Some(name) => {
-            let mut cfg = config::load()?;
-            if cfg.servers.remove(&name).is_none() {
-                bail!(
-                    "没有名为 {name} 的服务器；已登录：{}（用 embydown servers 查看）",
-                    cfg.name_list()
-                );
-            }
-            if cfg.servers.is_empty() {
-                config::clear()?;
+            let remaining = config::edit(|cfg| {
+                if cfg.servers.remove(&name).is_none() {
+                    bail!(
+                        "没有名为 {name} 的服务器；已登录：{}（用 embydown servers 查看）",
+                        cfg.name_list()
+                    );
+                }
+                Ok(cfg.servers.len())
+            })?;
+            if remaining == 0 {
+                // 保留 settings：退出登录不应该丢掉下载目录等设置。
                 println!("👋 已退出 {name}（已无登录服务器）");
             } else {
-                config::save(&cfg)?;
-                println!("👋 已退出 {name}（剩余 {} 个服务器）", cfg.servers.len());
+                println!("👋 已退出 {name}（剩余 {remaining} 个服务器）");
             }
         }
         None => {
-            if config::clear()? {
-                println!("👋 已清除所有登录信息");
+            let has_servers = config::load_optional()?
+                .map(|cfg| !cfg.servers.is_empty())
+                .unwrap_or(false);
+            if has_servers {
+                config::edit(|cfg| {
+                    cfg.servers.clear();
+                    Ok(())
+                })?;
+                println!("👋 已清除所有登录信息（下载设置已保留）");
             } else {
                 println!("当前没有保存的登录信息");
             }
@@ -237,21 +245,13 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             print_detail(&item);
         }
 
-        Cmd::Url {
-            server,
-            id,
-            transcode,
-        } => {
+        Cmd::Url { server, id } => {
             let (name, profile) = pick_one(&cfg, server.server.as_deref())?;
             let client = client_for(name, profile).await?;
             let item = client.item(&id).await?;
-            let t = transcode.to_opts();
             println!("条目: {} ({}，服务器 {name})", item.title(), item.display_type());
-            for (i, u) in client.media_urls(&item, t.as_ref()).iter().enumerate() {
+            for (i, u) in client.media_urls(&item).iter().enumerate() {
                 println!("{}[{}] {}", if i == 0 { "" } else { "备用" }, i, u);
-            }
-            if t.is_some() {
-                println!("\n⚠️  转码链是服务端实时转码，不支持分段并发与断点续传。");
             }
         }
 
@@ -263,14 +263,17 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             connections,
             jobs,
             limit_rate,
+            no_limit_rate,
             limit,
             version,
             season,
             overwrite,
+            no_overwrite,
+            subs: subs_flag,
             no_subs,
+            resume: resume_flag,
             no_resume,
             dry_run,
-            transcode,
         } => {
             let is_url = target.starts_with("http://") || target.starts_with("https://");
             // --dry-run：列出匹配结果与文件信息（相当于搜索），不下载
@@ -279,10 +282,83 @@ async fn run_command(cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
 
-            let rate = match limit_rate.as_deref() {
-                None => None,
-                Some(s) => Some(util::parse_rate(s).with_context(|| format!("无法解析限速值: {s}"))?),
+            // 命令行显式参数优先；未指定时使用 TUI「设置」页保存的配置。
+            let settings = &cfg.settings;
+
+            let out = match out {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => {
+                    let configured = settings.out.trim();
+                    if configured.is_empty() {
+                        std::path::PathBuf::from("./downloads")
+                    } else {
+                        std::path::PathBuf::from(configured)
+                    }
+                }
             };
+            let out = util::expand_tilde(&out)?;
+
+            let connections = connections.unwrap_or(settings.connections).clamp(1, 32);
+            let jobs = jobs.unwrap_or(settings.jobs).clamp(1, 8);
+
+            let rate = if no_limit_rate {
+                None
+            } else if let Some(s) = limit_rate.as_deref() {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(util::parse_rate(s).with_context(|| format!("无法解析限速值: {s}"))?)
+                }
+            } else {
+                let s = settings.limit.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(util::parse_rate(s).with_context(|| {
+                        format!(
+                            "配置文件中的限速值无效: {s}（修改 TUI「设置」或加 --no-limit-rate）"
+                        )
+                    })?)
+                }
+            };
+
+            let pattern = match pattern {
+                // 显式传空字符串表示“本次使用内置默认模板”，而不是回退到配置。
+                Some(p) if p.trim().is_empty() => None,
+                Some(p) => Some(p),
+                None => {
+                    let configured = settings.pattern.trim();
+                    if configured.is_empty() {
+                        None
+                    } else {
+                        Some(configured.to_string())
+                    }
+                }
+            };
+
+            let subs = if subs_flag {
+                true
+            } else if no_subs {
+                false
+            } else {
+                settings.subs
+            };
+            let overwrite = if overwrite {
+                true
+            } else if no_overwrite {
+                false
+            } else {
+                settings.overwrite
+            };
+            let resume = if resume_flag {
+                true
+            } else if no_resume {
+                false
+            } else {
+                settings.resume
+            };
+
             let (client, root) = if is_url {
                 (Client::new("http://127.0.0.1", false)?, direct_item(&target))
             } else {
@@ -297,15 +373,14 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             let opts = DownloadOpts {
                 out,
                 pattern,
-                connections: connections.clamp(1, 32),
+                connections,
                 // dry-run 下强制串行，避免多任务输出交错
-                jobs: if dry_run { 1 } else { jobs.clamp(1, 8) },
+                jobs: if dry_run { 1 } else { jobs },
                 limit_rate: rate,
-                resume: !no_resume,
+                resume,
                 overwrite,
-                subs: !no_subs,
+                subs,
                 dry_run,
-                transcode: transcode.to_opts(),
             };
             download::execute(&client, items, opts).await?;
         }
@@ -1083,7 +1158,7 @@ fn apply_version_choice(items: &mut Vec<Item>, arg: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-/// 是否存在多版本：单个条目有多个媒体源，或同一集被拆成了多个条目。
+/// 是否存在多版本：单个条目有多个媒体源，或同一部剧的同一集被拆成了多个条目。
 fn has_multiple_versions(items: &[Item]) -> bool {
     if items.iter().any(|i| {
         i.media_sources
@@ -1093,17 +1168,27 @@ fn has_multiple_versions(items: &[Item]) -> bool {
     }) {
         return true;
     }
-    let mut seen: std::collections::HashMap<(i32, i32), usize> =
+    // 必须带上剧集标识：合集里不同剧的 S01E01 不是同一集的不同版本。
+    let mut seen: std::collections::HashMap<(String, i32, i32), usize> =
         std::collections::HashMap::new();
     for item in items {
         if item.item_type.as_deref() == Some("Episode") {
             let e = item.episode_no();
             if e > 0 {
-                *seen.entry((item.season_no(), e)).or_insert(0) += 1;
+                let key = (series_key(item), item.season_no(), e);
+                *seen.entry(key).or_insert(0) += 1;
             }
         }
     }
     seen.values().any(|n| *n > 1)
+}
+
+/// 同一部剧的标识（优先 SeriesId；部分服务器不返回时退到剧名）。
+fn series_key(item: &Item) -> String {
+    item.series_id
+        .clone()
+        .or_else(|| item.series_name.clone())
+        .unwrap_or_default()
 }
 
 /// 与预览一致的版本名：多源条目用兜底名，单源条目只取能识别出的标签。
@@ -1170,7 +1255,7 @@ fn parse_version_arg(arg: &str) -> VersionPick {
 #[derive(Default)]
 struct VersionAcc {
     label: String,
-    episodes: std::collections::BTreeSet<(i32, i32)>,
+    episodes: std::collections::BTreeSet<(String, i32, i32)>,
     singles: usize,
     is_episode: bool,
     size: u64,
@@ -1207,7 +1292,8 @@ fn version_summaries(items: &[Item]) -> Vec<VersionSummary> {
                 });
             if item.item_type.as_deref() == Some("Episode") && item.episode_no() > 0 {
                 acc.is_episode = true;
-                acc.episodes.insert((item.season_no(), item.episode_no()));
+                acc.episodes
+                    .insert((series_key(item), item.season_no(), item.episode_no()));
             } else {
                 acc.singles += 1;
             }
@@ -1290,6 +1376,9 @@ fn apply_source(item: &mut Item, sources: &[MediaSource], idx: usize) {
     if source.container.is_some() {
         item.container = source.container.clone();
     }
+    // 只有“从多个源里挑一个”才禁止版本无关的回退接口；
+    // 单源条目虽然也带版本名，但 /Items/{id}/Download 仍是安全的。
+    item.source_locked = sources.len() > 1;
     item.media_sources = Some(vec![source]);
     item.version = Some(label);
 }
@@ -1299,9 +1388,21 @@ fn expand_versions(items: Vec<Item>) -> Vec<Item> {
     for mut item in items {
         let sources = item.media_sources.clone().unwrap_or_default();
         if sources.len() > 1 {
+            // 不同媒体源可能提取出相同的版本名；追加序号保证每个版本
+            // 落到不同的目录，否则后一个会覆盖前一个。
+            let mut used: Vec<String> = Vec::new();
             for i in 0..sources.len() {
                 let mut it = item.clone();
                 apply_source(&mut it, &sources, i);
+                let mut label = it.version.clone().unwrap_or_default();
+                if label.is_empty() {
+                    label = naming::version_label(&item, &sources[i], i);
+                }
+                if used.iter().any(|u| u.eq_ignore_ascii_case(&label)) {
+                    label = format!("{label} ({})", i + 1);
+                }
+                used.push(label.clone());
+                it.version = Some(label);
                 it.version_scoped = true;
                 out.push(it);
             }
@@ -1436,25 +1537,73 @@ fn is_playable(item: &Item) -> bool {
 /// 纯直链 → 伪造一个 Item，让下载器复用同一套分块逻辑。
 fn direct_item(url: &str) -> Item {
     let parsed = reqwest::Url::parse(url).ok();
-    let last = parsed
+    let segments: Vec<String> = parsed
         .as_ref()
         .and_then(|u| u.path_segments())
-        .and_then(|mut segs| segs.next_back())
-        .map(percent_decode)
+        .map(|segs| segs.map(percent_decode).collect())
+        .unwrap_or_default();
+    let last = segments.last().cloned().unwrap_or_default();
+    // Emby 风格：/Videos/{id}/stream、/Audio/{id}/stream、/Items/{id}/Download。
+    // 这些路径的末段是 `stream`/`Download`，不能拿来当文件名。
+    let media_id = segments
+        .iter()
+        .position(|s| matches!(s.as_str(), "Videos" | "Audio" | "Items"))
+        .and_then(|i| segments.get(i + 1))
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "download.bin".to_string());
+        .cloned();
+    let query_ext = parsed
+        .as_ref()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Container"))
+                .map(|(_, v)| v.to_string())
+        })
+        .filter(|v| is_plain_ext(v));
     let (stem, ext) = match last.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() && e.len() <= 5 => (s.to_string(), e.to_ascii_lowercase()),
-        _ => (last.clone(), "bin".to_string()),
+        Some((s, e)) if !s.is_empty() && is_plain_ext(e) => {
+            (s.to_string(), e.to_ascii_lowercase())
+        }
+        _ => (last.clone(), String::new()),
+    };
+    let generic = matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "" | "stream" | "download" | "file" | "original"
+    );
+    // 取不到有意义的名字时用条目 ID：不同 ID 的直链不会再互相覆盖/被跳过。
+    let name = if generic {
+        media_id.unwrap_or_else(|| format!("direct-{:016x}", stable_hash(url)))
+    } else {
+        stem
+    };
+    let ext = if !ext.is_empty() {
+        ext
+    } else if let Some(q) = query_ext {
+        q.to_ascii_lowercase()
+    } else {
+        "bin".to_string()
     };
     Item {
         id: "direct".to_string(),
-        name: Some(stem),
+        name: Some(name),
         item_type: Some("Video".to_string()),
         container: Some(ext),
         direct_url: Some(url.to_string()),
         ..Default::default()
     }
+}
+
+fn is_plain_ext(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 5 && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// FNV-1a：稳定、无依赖，用于给无法从路径推断名字的 URL 生成短标识。
+fn stable_hash(s: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1693,6 +1842,26 @@ mod tests {
     }
 
     #[test]
+    fn only_multi_source_items_are_marked_as_locked() {
+        let items = vec![
+            ep("a", 1, 1, &["ANi", "Nekomoe"]),
+            ep("c", 1, 2, &["Nekomoe"]),
+        ];
+        let (kept, _) = filter_to_version(items, "Nekomoe");
+        assert!(kept[0].source_locked, "多源条目锁定后不能用版本无关的回退接口");
+        assert!(!kept[1].source_locked, "单源条目的回退接口仍然安全");
+    }
+
+    #[test]
+    fn boxset_with_different_series_is_not_multiple_versions() {
+        let mut a = ep("a", 1, 1, &["1080p"]);
+        a.series_name = Some("剧A".into());
+        let mut b = ep("b", 1, 1, &["1080p"]);
+        b.series_name = Some("剧B".into());
+        assert!(!has_multiple_versions(&[a, b]));
+    }
+
+    #[test]
     fn expand_versions_labels_single_source_episodes() {
         let items = vec![
             ep("a", 1, 1, &["ANi", "Nekomoe"]),
@@ -1734,5 +1903,48 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "b");
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn direct_link_names_use_media_id_instead_of_generic_segment() {
+        let stream = direct_item("http://host:8096/Videos/abc123/stream?static=true&api_key=k");
+        assert_eq!(stream.title(), "abc123");
+        assert_eq!(stream.ext(), "bin");
+
+        let other = direct_item("http://host:8096/Videos/def456/stream?static=true");
+        assert_ne!(stream.title(), other.title());
+    }
+
+    #[test]
+    fn direct_link_names_keep_real_filenames_and_container_hints() {
+        let file = direct_item("http://host/media/movie.mkv");
+        assert_eq!(file.title(), "movie");
+        assert_eq!(file.ext(), "mkv");
+
+        let hinted = direct_item("http://host/Videos/9/stream?static=false&Container=mp4");
+        assert_eq!(hinted.title(), "9");
+        assert_eq!(hinted.ext(), "mp4");
+    }
+
+    #[test]
+    fn direct_link_names_fall_back_to_stable_hash() {
+        let a = direct_item("http://host/");
+        let b = direct_item("http://host/other/");
+        assert!(a.title().starts_with("direct-"));
+        assert_ne!(a.title(), b.title());
+        // 同一条 URL 的名字必须稳定，才能续传/跳过。
+        assert_eq!(a.title(), direct_item("http://host/").title());
+    }
+
+    #[test]
+    fn expand_versions_disambiguates_identical_labels() {
+        let items = vec![ep("a", 1, 1, &["Same", "Same"])];
+        let out = expand_versions(items);
+        let labels: Vec<&str> = out
+            .iter()
+            .map(|i| i.version.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(labels, vec!["Same", "Same (2)"]);
+        assert!(out.iter().all(|i| i.version_scoped));
     }
 }

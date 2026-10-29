@@ -1,5 +1,7 @@
 //! 小工具：日志、字节格式化、限速解析、文件名清洗。
 
+use anyhow::{Context, Result};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static VERBOSE: AtomicU8 = AtomicU8::new(0);
@@ -50,10 +52,15 @@ pub fn parse_rate(s: &str) -> Option<u64> {
         _ => (s, 1),
     };
     let v: f64 = num.trim().parse().ok()?;
-    if v <= 0.0 {
+    if !v.is_finite() || v <= 0.0 {
         return None;
     }
-    Some((v * mult as f64) as u64)
+    let bytes = v * mult as f64;
+    // 小于 1 字节/秒的值（如 0.5）截断后会变成 0，导致限速器除零 panic。
+    if !bytes.is_finite() || bytes < 1.0 {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
 /// Emby 的 RunTimeTicks 是 100ns 单位。
@@ -105,4 +112,65 @@ pub fn truncate_component(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     s[..end].trim_end().to_string()
+}
+
+/// 展开路径开头的 `~`（仅 `~` 和 `~/...`）。
+///
+/// clap/PathBuf 不会展开 shell 的波浪号，`-o "~/Downloads"` 会真的在当前
+/// 目录下创建一个名为 `~` 的文件夹。这里统一在真正使用路径前展开。
+pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first == "~" => {
+            let home = std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+                .context("无法展开 ~：HOME 未设置")?;
+            let rest = components.as_path();
+            Ok(if rest.as_os_str().is_empty() {
+                home
+            } else {
+                home.join(rest)
+            })
+        }
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rate_rejects_values_that_round_to_zero() {
+        assert_eq!(parse_rate("0.5"), None);
+        assert_eq!(parse_rate("0.0001"), None);
+        assert_eq!(parse_rate("0"), None);
+        assert_eq!(parse_rate("NaN"), None);
+        assert_eq!(parse_rate("inf"), None);
+    }
+
+    #[test]
+    fn parse_rate_units() {
+        assert_eq!(parse_rate("5M"), Some(5 * 1024 * 1024));
+        assert_eq!(parse_rate("800K"), Some(800 * 1024));
+        assert_eq!(parse_rate("1024"), Some(1024));
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        assert_eq!(expand_tilde(Path::new("~")).unwrap(), home);
+        assert_eq!(
+            expand_tilde(Path::new("~/Movies/anime")).unwrap(),
+            home.join("Movies/anime")
+        );
+        assert_eq!(expand_tilde(Path::new("/abs/path")).unwrap(), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde(Path::new("./relative")).unwrap(), PathBuf::from("./relative"));
+        // ~user 不做展开（避免猜错用户）
+        assert_eq!(expand_tilde(Path::new("~user/x")).unwrap(), PathBuf::from("~user/x"));
+    }
 }

@@ -79,7 +79,14 @@ embydown ui       # 等价写法
 | 浏览 | 服务器 → 媒体库 → 剧集 / 季 / 分集逐层浏览 |
 | 下载 | 后台下载队列：每个服务器一条独立下载流，显示进度、排队、完成/失败统计 |
 | 服务器 | `a` 登录（账号密码 / API Key）、`d` 删除、`Enter` 设为搜索范围 |
-| 设置 | 输出目录、连接数、每服务器并发、限速、字幕、覆盖、续传、转码、命名模板 |
+| 设置 | 输出目录、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
+
+「设置」页的修改会立即写入配置文件（与登录信息同一个 `config.json`），重启 TUI 后仍然生效；
+`logout` 只清除登录信息，不会重置这些下载设置。
+
+命令行 `embydown dl` 也把这些设置作为默认值（输出目录、连接数、并发、限速、字幕、覆盖、续传、命名模板），
+命令行显式传参时以命令行为准。需要临时反着覆盖时可用 `--no-overwrite`、`--no-resume`、`--no-subs`、
+`--no-limit-rate`；`--pattern ""` 表示本次使用内置默认命名模板。
 
 下载确认页会先解析条目：
 
@@ -116,6 +123,7 @@ embydown dl 关键字 --dry-run --limit 50
 
 # 去掉 --dry-run 即可交互选择并下载
 embydown dl 关键字 -o ./downloads
+# 输出目录支持 ~ 展开：-o ~/Downloads 会存到 $HOME/Downloads
 
 # 查看条目详情（含媒体源、流信息、大小）
 embydown info <ITEM_ID> --server media.micu.hk
@@ -216,14 +224,6 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 ## 字幕
 
 默认下载外挂字幕（`--no-subs` 关闭）：从 `MediaStreams` 里取 `Type=Subtitle && IsExternal=true` 的流，优先用服务器给的 `DeliveryUrl`，否则按 `/Videos/{id}/{msId}/Subtitles/{index}/Stream.{codec}` 构造。文件名与视频同名并追加语言，例如 `xxx.zh.srt`。
-
-## 转码下载（非默认）
-
-```bash
-embydown dl <ID> --transcode --max-height 720 --video-bitrate 3000 -o ./downloads
-```
-
-注意：转码链是服务端实时转码，**不支持分段并发与断点续传**，且下载结果不是原始画质。
 
 ## 发布
 

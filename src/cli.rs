@@ -107,15 +107,13 @@ pub enum Cmd {
         id: String,
     },
 
-    /// 只打印直链（默认直链，加 --transcode 出转码链），可粘到浏览器/IDM
+    /// 只打印直链（static stream / Download），可粘到浏览器/IDM
     #[command(alias = "link")]
     Url {
         #[command(flatten)]
         server: ServerArg,
 
         id: String,
-        #[command(flatten)]
-        transcode: TranscodeArgs,
     },
 
     /// 下载条目（电影 / 单集 / 整季 / 整剧 / 媒体库）
@@ -127,25 +125,29 @@ pub enum Cmd {
         /// 条目 ID（可写 `名称:ID`）、片名关键字，或 http(s) 直链
         target: String,
 
-        /// 输出目录
-        #[arg(short = 'o', long, default_value = "./downloads")]
-        out: PathBuf,
+        /// 输出目录（省略时使用配置文件中的「输出目录」，默认 ./downloads）
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
 
         /// 命名模板，如 "{series} ({seriesyear})/Season {season5}/{series} - S{season5}E{episode5}.{ext}"
         #[arg(long)]
         pattern: Option<String>,
 
-        /// 每个文件的并发连接数（分块）
-        #[arg(short = 'c', long, default_value_t = 8)]
-        connections: usize,
+        /// 每个文件的并发连接数（分块）；省略时用配置文件中的值
+        #[arg(short = 'c', long)]
+        connections: Option<usize>,
 
-        /// 同时下载几个文件
-        #[arg(short = 'j', long, default_value_t = 2)]
-        jobs: usize,
+        /// 同时下载几个文件；省略时用配置文件中的值
+        #[arg(short = 'j', long)]
+        jobs: Option<usize>,
 
-        /// 限速，如 5M / 800K
-        #[arg(long)]
+        /// 限速，如 5M / 800K；省略时用配置文件中的值
+        #[arg(long, conflicts_with = "no_limit_rate")]
         limit_rate: Option<String>,
+
+        /// 本次不限速（覆盖配置文件）
+        #[arg(long, conflicts_with = "limit_rate")]
+        no_limit_rate: bool,
 
         /// 按关键字匹配时的结果上限
         #[arg(long, default_value_t = 30)]
@@ -160,79 +162,32 @@ pub enum Cmd {
         #[arg(long)]
         season: Vec<i32>,
 
-        /// 覆盖已存在文件
-        #[arg(long)]
+        /// 覆盖已存在文件（覆盖配置文件）
+        #[arg(long, conflicts_with = "no_overwrite")]
         overwrite: bool,
 
-        /// 不下载外挂字幕
-        #[arg(long)]
+        /// 不覆盖已存在文件（覆盖配置文件）
+        #[arg(long, conflicts_with = "overwrite")]
+        no_overwrite: bool,
+
+        /// 下载外挂字幕（覆盖配置文件）
+        #[arg(long, conflicts_with = "no_subs")]
+        subs: bool,
+
+        /// 不下载外挂字幕（覆盖配置文件）
+        #[arg(long, conflicts_with = "subs")]
         no_subs: bool,
 
-        /// 关闭断点续传
-        #[arg(long)]
+        /// 启用断点续传（覆盖配置文件）
+        #[arg(long, conflicts_with = "no_resume")]
+        resume: bool,
+
+        /// 关闭断点续传（覆盖配置文件）
+        #[arg(long, conflicts_with = "resume")]
         no_resume: bool,
 
         /// 只列出匹配结果与文件信息（大小、分辨率、编码），不下载
         #[arg(long)]
         dry_run: bool,
-
-        #[command(flatten)]
-        transcode: TranscodeArgs,
     },
-}
-
-#[derive(Debug, Args, Clone, Default)]
-pub struct TranscodeArgs {
-    /// 不用直链，改用服务端转码流
-    #[arg(long)]
-    pub transcode: bool,
-
-    /// 转码容器：mp4 / mkv / ts
-    #[arg(long, default_value = "mp4")]
-    pub container: String,
-
-    /// 视频编码：h264 / hevc
-    #[arg(long)]
-    pub video_codec: Option<String>,
-
-    /// 音频编码：aac / mp3
-    #[arg(long)]
-    pub audio_codec: Option<String>,
-
-    /// 最大高度：1080 / 720
-    #[arg(long)]
-    pub max_height: Option<u32>,
-
-    /// 视频码率（kbps）
-    #[arg(long)]
-    pub video_bitrate: Option<u32>,
-
-    /// 音频码率（kbps）
-    #[arg(long)]
-    pub audio_bitrate: Option<u32>,
-}
-
-impl TranscodeArgs {
-    pub fn to_opts(&self) -> Option<crate::model::TranscodeOpts> {
-        if !self.transcode {
-            // 显式给了转码参数也视为要转码
-            let touched = self.video_codec.is_some()
-                || self.audio_codec.is_some()
-                || self.max_height.is_some()
-                || self.video_bitrate.is_some()
-                || self.audio_bitrate.is_some()
-                || self.container != "mp4";
-            if !touched {
-                return None;
-            }
-        }
-        Some(crate::model::TranscodeOpts {
-            container: self.container.clone(),
-            video_codec: self.video_codec.clone(),
-            audio_codec: self.audio_codec.clone(),
-            max_height: self.max_height,
-            video_bitrate: self.video_bitrate,
-            audio_bitrate: self.audio_bitrate,
-        })
-    }
 }

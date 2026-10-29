@@ -9,7 +9,12 @@ use crate::util::{sanitize_component, sanitize_path, truncate_component};
 pub fn default_pattern(item: &Item) -> &'static str {
     // 只有本次同时下载多个版本（--version all）时才用版本目录，
     // 避免单版本下载出现 `[Nekomoe kissaten@LoliHouse]` 之类的多余层级。
-    let scoped = item.version.is_some() && item.version_scoped;
+    let scoped = item.version_scoped
+        && item
+            .version
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
     match item.item_type.as_deref() {
         // Emby/Jellyfin 标准剧集结构：剧名 (年份)/Season 00001/剧名 - S00001E00001.ext
         Some("Episode") if scoped => {
@@ -23,7 +28,11 @@ pub fn default_pattern(item: &Item) -> &'static str {
             "影视/电影/{title} ({year}) [{version}]/{title} ({year}).{ext}"
         }
         Some("Movie") => "影视/电影/{title} ({year})/{title} ({year}).{ext}",
+        // 音频/其他类型（Video、MusicVideo、Trailer…）也必须带版本目录，
+        // 否则 --version all 时多个版本会解析到同一路径互相覆盖。
+        Some("Audio") if scoped => "影视/音乐/{title} [{version}]/{title}.{ext}",
         Some("Audio") => "影视/音乐/{title}.{ext}",
+        _ if scoped => "影视/其他/{title} [{version}]/{title}.{ext}",
         _ => "影视/其他/{title}.{ext}",
     }
 }
@@ -346,10 +355,26 @@ pub fn render(pattern: &str, item: &Item, ext: &str) -> String {
 }
 
 /// 字幕文件相对路径：与视频同名，追加语言与字幕格式。
-pub fn subtitle_path(video_rel: &str, lang: &str, ext: &str, forced: bool) -> String {
+///
+/// `disambiguator` 用于同一语言存在多条字幕轨道时区分（如 `chi.2`、`chi.简体`），
+/// 否则后一条会覆盖/跳过前一条。
+pub fn subtitle_path(
+    video_rel: &str,
+    lang: &str,
+    ext: &str,
+    forced: bool,
+    disambiguator: Option<&str>,
+) -> String {
     let base = video_rel.rsplit_once('.').map(|(b, _)| b).unwrap_or(video_rel);
     let lang = if lang.trim().is_empty() { "und" } else { lang };
-    let suffix = if forced { ".forced" } else { "" };
+    let mut suffix = String::new();
+    if let Some(d) = disambiguator.map(str::trim).filter(|d| !d.is_empty()) {
+        suffix.push('.');
+        suffix.push_str(&sanitize_component(d));
+    }
+    if forced {
+        suffix.push_str(".forced");
+    }
     format!(
         "{}.{}{}.{}",
         base,
@@ -357,6 +382,22 @@ pub fn subtitle_path(video_rel: &str, lang: &str, ext: &str, forced: bool) -> St
         suffix,
         sanitize_component(ext)
     )
+}
+
+/// 把 Emby 的 `MediaStream.Codec` 映射成播放器/媒体库能识别的字幕扩展名。
+///
+/// Emby 对外挂字幕常返回 `subrip`，若直接当扩展名会得到 `xxx.subrip`，
+/// Emby/Jellyfin、mpv、VLC 都不会把该文件关联到视频。
+pub fn subtitle_ext(codec: Option<&str>) -> String {
+    match codec.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "ass" | "ssa" => "ass".into(),
+        "webvtt" | "vtt" => "vtt".into(),
+        "ttml" | "dfxp" => "ttml".into(),
+        "hdmv_pgs_subtitle" | "pgs" | "pgssub" => "sup".into(),
+        "dvd_subtitle" | "dvdsub" | "vobsub" => "sub".into(),
+        // srt / subrip / mov_text / sami / microdvd 等纯文本格式统一请求 srt
+        _ => "srt".into(),
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +483,18 @@ mod tests {
     fn single_version_selection_has_no_version_dir() {
         let mut item = episode();
         item.version = Some("Nekomoe kissaten@LoliHouse".into());
+        let rel = render(default_pattern(&item), &item, "mkv");
+        assert_eq!(
+            rel,
+            "影视/剧集/示例剧 (2023)/Season 00001/示例剧 - S00001E00002.mkv"
+        );
+    }
+
+    #[test]
+    fn scoped_but_empty_version_does_not_create_empty_bracket() {
+        let mut item = episode();
+        item.version = Some("  ".into());
+        item.version_scoped = true;
         let rel = render(default_pattern(&item), &item, "mkv");
         assert_eq!(
             rel,
@@ -584,8 +637,24 @@ mod tests {
     #[test]
     fn subtitle_naming() {
         assert_eq!(
-            subtitle_path("示例剧/Season 01/a - S01E02 - t.mkv", "zh-CN", "srt", false),
+            subtitle_path("示例剧/Season 01/a - S01E02 - t.mkv", "zh-CN", "srt", false, None),
             "示例剧/Season 01/a - S01E02 - t.zh-CN.srt"
         );
+        assert_eq!(
+            subtitle_path("a.mkv", "chi", "srt", false, Some("2")),
+            "a.chi.2.srt"
+        );
+        assert_eq!(
+            subtitle_path("a.mkv", "chi", "srt", true, None),
+            "a.chi.forced.srt"
+        );
+    }
+
+    #[test]
+    fn subtitle_codec_maps_to_known_extension() {
+        assert_eq!(subtitle_ext(Some("subrip")), "srt");
+        assert_eq!(subtitle_ext(Some("SSA")), "ass");
+        assert_eq!(subtitle_ext(Some("webvtt")), "vtt");
+        assert_eq!(subtitle_ext(None), "srt");
     }
 }

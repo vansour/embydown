@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -20,13 +20,16 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::config::{self, Config, Profile};
+use crate::config::{self, Config, Profile, Settings};
 use crate::download::DownloadOpts;
 use crate::manager::{FinishedStatus, Manager};
 use crate::emby::Client;
-use crate::model::{Item, TranscodeOpts};
+use crate::model::Item;
 use crate::util::{format_bytes, parse_rate};
-use crate::{expand_versions, filter_to_version, resolve_item, version_summaries, VersionSummary};
+use crate::{
+    expand_versions, filter_to_version, has_multiple_versions, resolve_item, version_summaries,
+    VersionSummary,
+};
 use unicode_width::UnicodeWidthStr;
 
 const SEARCH_LIMIT: u32 = 30;
@@ -220,34 +223,6 @@ struct BrowseState {
     pending: Option<u64>,
 }
 
-struct Settings {
-    out: String,
-    connections: usize,
-    jobs: usize,
-    limit: String,
-    subs: bool,
-    overwrite: bool,
-    resume: bool,
-    transcode: u8, // 0=关闭 1=720p 2=1080p
-    pattern: String,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            out: "./downloads".into(),
-            connections: 8,
-            jobs: 2,
-            limit: String::new(),
-            subs: true,
-            overwrite: false,
-            resume: true,
-            transcode: 0,
-            pattern: String::new(),
-        }
-    }
-}
-
 #[derive(Clone)]
 enum VersionChoice {
     Unset,
@@ -322,7 +297,8 @@ enum Msg {
     Prepared(Box<PreparedMsg>),
     LoggedIn {
         seq: u64,
-        result: Result<(String, Client), String>,
+        /// (别名, 客户端, 覆盖同名服务器的警告)
+        result: Result<(String, Client, Option<String>), String>,
     },
 }
 
@@ -364,6 +340,11 @@ impl App {
         clients: BTreeMap<String, Client>,
         msg_tx: mpsc::UnboundedSender<Msg>,
     ) -> Self {
+        // 设置持久化在 config.json 里；读取时做一次范围校正，
+        // 避免手工编辑配置后把并发数设成 0/超大值。
+        let mut settings = cfg.settings.clone();
+        settings.connections = settings.connections.clamp(1, 32);
+        settings.jobs = settings.jobs.clamp(1, 8);
         let mut servers = ListState::default();
         if !cfg.servers.is_empty() {
             servers.select(Some(0));
@@ -380,7 +361,7 @@ impl App {
             search: SearchState::default(),
             browse: BrowseState::default(),
             servers,
-            settings: Settings::default(),
+            settings,
             settings_state: ListState::default().with_selected(Some(0)),
             detail: None,
             modal: Modal::None,
@@ -390,6 +371,19 @@ impl App {
             seq: 0,
             prepare_seq: None,
             login_seq: None,
+        }
+    }
+
+    /// 把当前设置写回 config.json（保留服务器列表）。
+    fn save_settings(&mut self) {
+        let settings = self.settings.clone();
+        let to_write = settings.clone();
+        match config::edit(move |cfg| {
+            cfg.settings = to_write;
+            Ok(())
+        }) {
+            Ok(()) => self.cfg.settings = settings,
+            Err(e) => self.set_error(format!("保存设置失败：{e:#}")),
         }
     }
 
@@ -503,12 +497,15 @@ impl App {
                 self.login_seq = None;
                 self.busy = None;
                 match result {
-                    Ok((name, client)) => {
+                    Ok((name, client, warning)) => {
                         self.cfg = config::load_optional().ok().flatten().unwrap_or_default();
                         self.clients.insert(name.clone(), client);
                         self.search.server = Some(name.clone());
                         self.tab = Tab::Servers;
-                        self.set_ok(format!("已登录 {name}，并设为搜索范围"));
+                        match warning {
+                            Some(w) => self.set_warn(w),
+                            None => self.set_ok(format!("已登录 {name}，并设为搜索范围")),
+                        }
                     }
                     Err(err) => {
                         self.modal = Modal::Message(format!("登录失败：{err}"), true);
@@ -729,7 +726,7 @@ impl App {
         Ok(())
     }
 
-    const SETTING_ROWS: usize = 9;
+    const SETTING_ROWS: usize = 8;
 
     fn on_settings_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
@@ -774,30 +771,54 @@ impl App {
     }
 
     fn adjust_setting(&mut self, delta: isize) {
-        match self.settings_state.selected().unwrap_or(0) {
+        let changed = match self.settings_state.selected().unwrap_or(0) {
             1 => {
                 self.settings.connections =
-                    (self.settings.connections as isize + delta).clamp(1, 32) as usize
+                    (self.settings.connections as isize + delta).clamp(1, 32) as usize;
+                true
             }
-            2 => self.settings.jobs = (self.settings.jobs as isize + delta).clamp(1, 8) as usize,
-            4 => self.settings.subs = !self.settings.subs,
-            5 => self.settings.overwrite = !self.settings.overwrite,
-            6 => self.settings.resume = !self.settings.resume,
-            7 => {
-                self.settings.transcode =
-                    ((self.settings.transcode as isize + delta).rem_euclid(3)) as u8
+            2 => {
+                self.settings.jobs =
+                    (self.settings.jobs as isize + delta).clamp(1, 8) as usize;
+                true
             }
-            _ => {}
+            4 => {
+                self.settings.subs = !self.settings.subs;
+                true
+            }
+            5 => {
+                self.settings.overwrite = !self.settings.overwrite;
+                true
+            }
+            6 => {
+                self.settings.resume = !self.settings.resume;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.save_settings();
         }
     }
 
     fn toggle_setting(&mut self) {
-        match self.settings_state.selected().unwrap_or(0) {
-            4 => self.settings.subs = !self.settings.subs,
-            5 => self.settings.overwrite = !self.settings.overwrite,
-            6 => self.settings.resume = !self.settings.resume,
-            7 => self.settings.transcode = (self.settings.transcode + 1) % 3,
-            _ => {}
+        let changed = match self.settings_state.selected().unwrap_or(0) {
+            4 => {
+                self.settings.subs = !self.settings.subs;
+                true
+            }
+            5 => {
+                self.settings.overwrite = !self.settings.overwrite;
+                true
+            }
+            6 => {
+                self.settings.resume = !self.settings.resume;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.save_settings();
         }
     }
 
@@ -805,7 +826,7 @@ impl App {
         let (title, value, purpose) = match self.settings_state.selected().unwrap_or(0) {
             0 => ("输出目录", self.settings.out.clone(), Purpose::OutDir),
             3 => ("限速（如 5M，留空不限速）", self.settings.limit.clone(), Purpose::LimitRate),
-            8 => ("命名模板（留空使用默认）", self.settings.pattern.clone(), Purpose::Pattern),
+            7 => ("命名模板（留空使用默认）", self.settings.pattern.clone(), Purpose::Pattern),
             _ => return,
         };
         self.modal = Modal::Input(InputModal {
@@ -946,10 +967,21 @@ impl App {
     }
 
     fn open_detail(&mut self, server: String, root: Item, files: Vec<Item>) {
-        let versions = version_summaries(&files);
+        // 只有“同一集有多个媒体源 / 同一集出现多条”才算多版本。
+        // 单源条目文件名里的 1080p、发布组等只是片源信息；据此过滤会把
+        // 未标注的集静默丢掉。
+        let versions = if has_multiple_versions(&files) {
+            version_summaries(&files)
+        } else {
+            Vec::new()
+        };
+        let covered = versions
+            .first()
+            .map(|v| v.count >= files.len())
+            .unwrap_or(false);
         let choice = if versions.is_empty() {
             VersionChoice::NoChoice
-        } else if versions.len() == 1 {
+        } else if versions.len() == 1 && covered {
             VersionChoice::One(0)
         } else {
             VersionChoice::Unset
@@ -974,23 +1006,19 @@ impl App {
     }
 
     fn start_delete(&mut self, name: &str) {
-        match config::load_optional() {
-            Ok(Some(mut cfg)) => {
-                cfg.servers.remove(name);
-                match config::save(&cfg) {
-                    Ok(_) => {
-                        self.cfg = cfg;
-                        self.clients.remove(name);
-                        if self.search.server.as_deref() == Some(name) {
-                            self.search.server = None;
-                        }
-                        self.set_ok(format!("已删除服务器 {name}"));
-                    }
-                    Err(e) => self.set_error(format!("保存配置失败：{e:#}")),
+        match config::edit(|cfg| {
+            cfg.servers.remove(name);
+            Ok(cfg.clone())
+        }) {
+            Ok(cfg) => {
+                self.cfg = cfg;
+                self.clients.remove(name);
+                if self.search.server.as_deref() == Some(name) {
+                    self.search.server = None;
                 }
+                self.set_ok(format!("已删除服务器 {name}"));
             }
-            Ok(None) => {}
-            Err(e) => self.set_error(format!("读取配置失败：{e:#}")),
+            Err(e) => self.set_error(format!("保存配置失败：{e:#}")),
         }
     }
 
@@ -1020,7 +1048,7 @@ impl App {
         self.modal = Modal::None;
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
-            let result: Result<(String, Client), String> = async {
+            let result: Result<(String, Client, Option<String>), String> = async {
                 let mut client = Client::new(&server, insecure).map_err(|e| format!("{e:#}"))?;
                 let username = if !api_key.is_empty() {
                     client.token = api_key.clone();
@@ -1039,21 +1067,25 @@ impl App {
                 } else {
                     name.clone()
                 };
-                let mut cfg = config::load_optional()
-                    .map_err(|e| format!("{e:#}"))?
-                    .unwrap_or_default();
-                cfg.servers.insert(
-                    name.clone(),
-                    Profile {
-                        server: client.server.clone(),
-                        token: client.token.clone(),
-                        user_id: client.user_id.clone(),
-                        username,
-                        insecure,
-                    },
-                );
-                config::save(&cfg).map_err(|e| format!("{e:#}"))?;
-                Ok((name, client))
+                let profile = Profile {
+                    server: client.server.clone(),
+                    token: client.token.clone(),
+                    user_id: client.user_id.clone(),
+                    username,
+                    insecure,
+                };
+                let replaced = config::edit(|cfg| Ok(cfg.servers.insert(name.clone(), profile)))
+                    .map_err(|e| format!("{e:#}"))?;
+                // 与 CLI 一致：覆盖了指向另一个地址的同名服务器时给出警告。
+                let warning = replaced
+                    .filter(|old| old.server != client.server)
+                    .map(|old| {
+                        format!(
+                            "⚠️  已覆盖同名服务器 {name}（原地址 {}）",
+                            old.server
+                        )
+                    });
+                Ok((name, client, warning))
             }
             .await;
             let _ = tx.send(Msg::LoggedIn { seq, result });
@@ -1069,20 +1101,10 @@ impl App {
         } else {
             Some(parse_rate(limit).with_context(|| format!("无法解析限速值：{limit}"))?)
         };
-        let transcode = match self.settings.transcode {
-            0 => None,
-            n => Some(TranscodeOpts {
-                container: "mp4".into(),
-                video_codec: Some("h264".into()),
-                audio_codec: Some("aac".into()),
-                max_height: Some(if n == 1 { 720 } else { 1080 }),
-                video_bitrate: None,
-                audio_bitrate: None,
-            }),
-        };
         let out = self.settings.out.trim();
+        let out = if out.is_empty() { "./downloads" } else { out };
         Ok(DownloadOpts {
-            out: PathBuf::from(if out.is_empty() { "./downloads" } else { out }),
+            out: crate::util::expand_tilde(Path::new(out))?,
             pattern: Some(self.settings.pattern.clone()).filter(|p| !p.trim().is_empty()),
             connections: self.settings.connections.clamp(1, 32),
             jobs: self.settings.jobs.clamp(1, 8),
@@ -1091,11 +1113,10 @@ impl App {
             overwrite: self.settings.overwrite,
             subs: self.settings.subs,
             dry_run: false,
-            transcode,
         })
     }
 
-    fn build_download(&self, d: &Detail) -> Result<(Client, Vec<Item>, DownloadOpts)> {
+    fn build_download(&self, d: &Detail) -> Result<(Client, Vec<Item>, DownloadOpts, usize)> {
         let client = if d.server == DIRECT_SERVER {
             Client::new("http://127.0.0.1", false).context("构建直链下载客户端失败")?
         } else {
@@ -1119,6 +1140,7 @@ impl App {
         if items.is_empty() {
             bail!("所选季下没有可下载的条目");
         }
+        let mut skipped = 0usize;
         items = match &d.choice {
             VersionChoice::Unset => bail!(
                 "请先选择版本：按 1-{} 选择，0 或 a 下载全部版本",
@@ -1132,20 +1154,22 @@ impl App {
                     .with_context(|| format!("版本序号超出范围：{}", i + 1))?
                     .label
                     .clone();
-                filter_to_version(items, &label).0
+                let (kept, skipped_n) = filter_to_version(items, &label);
+                skipped = skipped_n;
+                kept
             }
             VersionChoice::NoChoice => items,
         };
         if items.is_empty() {
             bail!("所选版本下没有可下载的条目");
         }
-        Ok((client, items, self.build_opts()?))
+        Ok((client, items, self.build_opts()?, skipped))
     }
 
     /// 加入后台下载队列：界面保持可用，每个服务器独立排队。
     fn start_download(&mut self, d: Detail) {
         match self.build_download(&d) {
-            Ok((client, items, opts)) => {
+            Ok((client, items, opts, skipped)) => {
                 let count = items.len();
                 let server = d.server.clone();
                 self.manager.enqueue(server.clone(), client, items, opts);
@@ -1153,7 +1177,14 @@ impl App {
                 self.modal = Modal::None;
                 self.tab = Tab::Downloads;
                 self.download_focus = Some(server.clone());
-                self.set_ok(format!("已加入 {server} 的下载队列（{count} 个文件）"));
+                let note = if skipped > 0 {
+                    format!("，跳过 {skipped} 个不含所选版本的条目")
+                } else {
+                    String::new()
+                };
+                self.set_ok(format!(
+                    "已加入 {server} 的下载队列（{count} 个文件{note}）"
+                ));
             }
             Err(e) => {
                 self.detail = Some(d);
@@ -1335,7 +1366,7 @@ impl App {
                                 if let Some(direct) = item.direct_url.clone() {
                                     url = Some(format!("（直链）\n\n{direct}"));
                                 } else if let Some(client) = self.clients.get(&d.server)
-                                    && let Some(u) = client.media_urls(item, None).first()
+                                    && let Some(u) = client.media_urls(item).first()
                                 {
                                     let note = if d.files.len() > 1 {
                                         format!(
@@ -1404,6 +1435,8 @@ impl App {
                 self.settings.pattern = im.input.text.clone();
             }
         }
+        // 输出目录/限速/模板修改后立即落盘，重启 TUI 仍然生效。
+        self.save_settings();
         Ok(())
     }
 
@@ -1840,14 +1873,6 @@ impl App {
             ("覆盖已存在文件", on_off(self.settings.overwrite)),
             ("断点续传", on_off(self.settings.resume)),
             (
-                "转码",
-                match self.settings.transcode {
-                    0 => "关闭".to_string(),
-                    1 => "720p".to_string(),
-                    _ => "1080p".to_string(),
-                },
-            ),
-            (
                 "命名模板",
                 if self.settings.pattern.trim().is_empty() {
                     "（默认）".to_string()
@@ -1869,7 +1894,7 @@ impl App {
             })
             .collect();
         let note = Line::from(Span::styled(
-            "  设置仅在本次运行内生效；下载时会显示在确认页。",
+            "  设置会立即保存到配置文件；下载时会显示在确认页。",
             Style::default().fg(Color::DarkGray),
         ));
         let list = List::new(items)
@@ -2236,7 +2261,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!(
-                "输出：{}    连接：{}    每服并发：{}    限速：{}    字幕：{}    覆盖：{}    转码：{}",
+                "输出：{}    连接：{}    每服并发：{}    限速：{}    字幕：{}    覆盖：{}",
                 self.settings.out,
                 self.settings.connections,
                 self.settings.jobs,
@@ -2246,12 +2271,7 @@ impl App {
                     self.settings.limit.clone()
                 },
                 on_off(self.settings.subs),
-                if self.settings.overwrite { "是" } else { "否" },
-                match self.settings.transcode {
-                    0 => "关",
-                    1 => "720p",
-                    _ => "1080p",
-                }
+                if self.settings.overwrite { "是" } else { "否" }
             ),
             Style::default().fg(Color::DarkGray),
         )));

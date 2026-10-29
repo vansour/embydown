@@ -149,6 +149,7 @@ async fn run(
                     items,
                     opts,
                 } = *cmd;
+                let mut reset_cancel = false;
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     let start_id = st.seq;
@@ -156,9 +157,7 @@ async fn run(
                     let entry = st.servers.entry(server.clone()).or_default();
                     if entry.stop_requested {
                         entry.stop_requested = false;
-                        if let Some(c) = ctx.get_mut(&server) {
-                            c.cancel = Arc::new(AtomicBool::new(false));
-                        }
+                        reset_cancel = true;
                     }
                     entry.max_jobs = opts.jobs.clamp(1, 8);
                     for (offset, item) in items.into_iter().enumerate() {
@@ -171,14 +170,26 @@ async fn run(
                         });
                     }
                 }
-                ctx.entry(server.clone()).or_insert_with(|| ServerCtx {
-                    client,
-                    limiter: Arc::new(Limiter::new(opts.limit_rate)),
-                    cancel: Arc::new(AtomicBool::new(false)),
-                });
-                // 同一服务器后续批次用新的限速器（已经在跑的任务保持旧的）
-                if let Some(c) = ctx.get_mut(&server) {
-                    c.limiter = Arc::new(Limiter::new(opts.limit_rate));
+                // 每次都刷新 Client：重新登录后 token / 地址 / 证书设置可能已变，
+                // 沿用旧 Client 会让新任务 401 或连到旧服务器。
+                match ctx.get_mut(&server) {
+                    Some(c) => {
+                        c.client = client;
+                        c.limiter = Arc::new(Limiter::new(opts.limit_rate));
+                        if reset_cancel {
+                            c.cancel = Arc::new(AtomicBool::new(false));
+                        }
+                    }
+                    None => {
+                        ctx.insert(
+                            server.clone(),
+                            ServerCtx {
+                                client,
+                                limiter: Arc::new(Limiter::new(opts.limit_rate)),
+                                cancel: Arc::new(AtomicBool::new(false)),
+                            },
+                        );
+                    }
                 }
             }
             Cmd::CancelServer(server) => {
@@ -293,14 +304,28 @@ fn dispatch(
     for (server, job, client, limiter, cancel, pb) in spawns {
         let tx = tx.clone();
         tokio::spawn(async move {
-            let res = download::download_one(&client, &job.item, &job.opts, &limiter, &cancel, &pb)
-                .await;
-            let cancelled = res
-                .as_ref()
-                .err()
-                .map(download::is_cancelled)
-                .unwrap_or(false);
-            let result = res.map_err(|e| format!("{e:#}"));
+            use futures_util::FutureExt;
+            // 下载任务内部的 panic 若逃出 tokio::spawn，就不会发送 Completed，
+            // ActiveJob 会永久占用并发槽位（TUI 里显示“运行”且删不掉）。
+            let outcome = std::panic::AssertUnwindSafe(download::download_one(
+                &client, &job.item, &job.opts, &limiter, &cancel, &pb,
+            ))
+            .catch_unwind()
+            .await;
+            let (result, cancelled) = match outcome {
+                Ok(res) => {
+                    let cancelled = res
+                        .as_ref()
+                        .err()
+                        .map(download::is_cancelled)
+                        .unwrap_or(false);
+                    (
+                        res.map_err(|e| crate::emby::redact_text(&format!("{e:#}"))),
+                        cancelled,
+                    )
+                }
+                Err(_) => (Err("任务崩溃（内部错误）".to_string()), false),
+            };
             let _ = tx.send(Cmd::Completed {
                 server,
                 id: job.id,
