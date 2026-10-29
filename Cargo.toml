@@ -1,0 +1,30 @@
+[package]
+name = "embydown"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.99"
+description = "Emby 媒体下载工具：默认走直链（static stream / Download），支持分块并发与断点续传"
+license = "MIT"
+
+[[bin]]
+name = "embydown"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+futures-util = "0.3"
+indicatif = "0.18"
+unicode-width = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

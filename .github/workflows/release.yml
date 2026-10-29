@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::标签是 ${GITHUB_REF_NAME}，但 Cargo.toml 版本是 $version"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-gnu
+          asset="embydown-${GITHUB_REF_NAME}-${target}"
+          mkdir -p "dist/${asset}"
+          cp target/release/embydown "dist/${asset}/"
+          cp README.md install.sh "dist/${asset}/"
+          tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
+          ( cd dist && sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256" )
+
+          # install.sh 用的稳定文件名：始终指向 latest release
+          cp "dist/${asset}.tar.gz" "dist/embydown-${target}.tar.gz"
+          ( cd dist && sha256sum "embydown-${target}.tar.gz" > "embydown-${target}.tar.gz.sha256" )
+
+          ls -lh dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            install.sh

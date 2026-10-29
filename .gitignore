@@ -1,0 +1,5 @@
+/target
+/downloads
+*.part
+*.part.json
+.DS_Store
