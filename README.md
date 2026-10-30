@@ -81,6 +81,9 @@ embydown ui       # 等价写法
 | 服务器 | `a` 登录（账号密码 / API Key）、`d` 删除、`Enter` 设为搜索范围 |
 | 设置 | 输出目录、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
 
+搜索结果按**相关度**排序：标题完全匹配 > 前缀匹配 > 包含匹配 > 剧名/路径匹配；
+多个服务器的结果合并后统一排序，同分时短标题优先。
+
 「设置」页的修改会立即写入配置文件（与登录信息同一个 `config.json`），重启 TUI 后仍然生效；
 `logout` 只清除登录信息，不会重置这些下载设置。
 
@@ -106,8 +109,23 @@ embydown          # 重新打开即可看到仍在进行的下载
 embydown history  # 查看历史记录（包括 TUI 关闭期间完成的）
 ```
 
-下载页按键：`↑↓` 选择服务器，`x` 取消该服务器的队列，`X` 取消全部，`c` 清空最近完成记录（同时删除历史文件）。
+下载页按键：`↑↓` 选择服务器，`x` 取消该服务器的队列，`X` 取消全部，`p` 暂停/继续当前服务器（`P` 全部），
+`r` 扫描未完成任务，`c` 清空最近完成记录（同时删除历史文件）。
 取消或退出时已完成的分块会保留，重新加入同一任务即可续传。
+暂停会把正在运行的任务放回队首并保留 `.part`，继续后从断点续传；暂停状态会写入 `queue.json`，后台服务重启后仍然保持暂停。
+
+**未完成任务找回**：在下载页按 `r`，会递归扫描输出目录里的 `.part` / `.part.json`，
+从文件名推导关键字（剧集取剧名并解析 `SxxExx`，电影去掉年份/质量标签），
+在所有服务器上搜索；剧集结果会自动展开 Series/Season，只匹配同一季集。
+选中一个来源后，下载会**写回原来的文件路径**并复用已有 `.part` 续传，不会生成一份新文件。
+不想开 TUI 时也可以用 CLI 控制（`--server <别名>` 只作用于单个服务器）：
+
+```bash
+embydown pause                      # 暂停全部服务器
+embydown pause --server media.micu.hk
+embydown resume                     # 继续全部
+embydown resume --server media.micu.hk
+```
 
 按键：`1-5` / `Tab` 切页，`↑↓` 选择，`Enter` 确认，`Esc` 返回，`?` 查看全部快捷键，`Ctrl+C` 随时退出。
 搜索输入框内普通按键会输入文字，因此切页请用 `Tab`。
@@ -118,7 +136,7 @@ TUI 会自动拉起后台服务（`embydown daemon`），它与 TUI 是独立进
 TUI 崩溃或关闭终端时，服务会忽略挂断信号继续下载；下次打开 TUI 会重新连接并显示进度。
 
 - 单实例：通过 `$XDG_RUNTIME_DIR/embydown/daemon.sock` 通信，`daemon.lock` 记录 PID，避免两个服务同时下载同一批文件
-- `queue.json`：当前排队/运行中的任务（含服务器凭证与直链），服务重启时会把运行中的任务放回队首，配合 `.part` 续传
+- `queue.json`：当前排队/运行中的任务（含服务器凭证、直链与暂停状态），服务重启时会把运行中的任务放回队首，配合 `.part` 续传
 - `history.jsonl`：每次任务结束追加一行，只增不改；任务失败也会记录，包含失败原因
 - `daemon.log`：后台服务的输出与错误，启动失败时先看这里
 
@@ -187,6 +205,11 @@ embydown dl "http://host:8096/Videos/<ID>/stream?static=true&api_key=<KEY>" -o .
 # 后台服务的下载记录（最新在前；--limit 0 显示全部）
 embydown history
 embydown history --limit 200
+
+# 暂停 / 继续后台下载队列（省略 --server 时为全部服务器）
+embydown pause
+embydown resume
+embydown pause --server media.micu.hk
 ```
 
 ## 已在真实服务器验证
@@ -264,13 +287,13 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 
 版本号在 `Cargo.toml`，变更记录见 [CHANGELOG.md](CHANGELOG.md)；推送 `v*` 标签会触发 `.github/workflows/release.yml`：
 
-- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.3` 对应版本 `0.0.3`）
+- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.4` 对应版本 `0.0.4`）
 - 构建 x86_64 release，打包二进制、README、CHANGELOG 和 install.sh，生成 SHA-256
 - 创建 GitHub Release 并上传产物
 
 ```bash
-git tag v0.0.3
-git push origin v0.0.3
+git tag v0.0.4
+git push origin v0.0.4
 ```
 
 `main` 分支的 push / PR 会运行 `.github/workflows/ci.yml`（clippy、测试、release 构建）。
@@ -307,6 +330,7 @@ src/tui.rs       交互界面（ratatui）
 src/manager.rs   后台下载队列（每服务器一条下载流）
 src/daemon.rs    后台下载服务（Unix socket 协议、单实例、自动拉起）
 src/store.rs     队列与下载记录持久化（queue.json / history.jsonl）
+src/repair.rs    未完成任务扫描、关键字推导与来源匹配
 src/model.rs     API 数据模型
 install.sh       一键安装脚本
 CHANGELOG.md     版本变更记录

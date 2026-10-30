@@ -72,6 +72,20 @@ pub enum Cmd {
         limit: usize,
     },
 
+    /// 暂停后台下载队列（先停止派发，正在下载的任务放回队首，保留断点）
+    Pause {
+        /// 只暂停指定服务器（login --name 的别名）；省略则暂停全部
+        #[arg(long, value_name = "NAME")]
+        server: Option<String>,
+    },
+
+    /// 继续被暂停的后台下载队列
+    Resume {
+        /// 只继续指定服务器；省略则继续全部
+        #[arg(long, value_name = "NAME")]
+        server: Option<String>,
+    },
+
     /// 登录并保存服务器与凭证（可重复执行以添加多个服务器）
     Login(LoginArgs),
 

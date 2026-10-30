@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
@@ -30,6 +31,13 @@ use crate::store;
 
 // ───────────────────────── 协议 ─────────────────────────
 
+/// 后台服务协议版本。
+///
+/// 0.0.3 及更早的守护进程没有这个字段；TUI 检测到旧服务后会先让它优雅退出，
+/// 再拉起当前版本的守护进程（队列已落盘，会继续下载）。
+/// 新增/修改请求或快照字段时递增。
+const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
@@ -37,12 +45,20 @@ enum Request {
         server: String,
         client: ClientCreds,
         items: Vec<Item>,
-        opts: DownloadOpts,
+        opts: Box<DownloadOpts>,
     },
     CancelServer {
         server: String,
     },
     CancelAll,
+    PauseServer {
+        server: String,
+    },
+    ResumeServer {
+        server: String,
+    },
+    PauseAll,
+    ResumeAll,
     ClearHistory,
     Snapshot,
     Ping,
@@ -55,6 +71,9 @@ struct Response {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<Snapshot>,
+    /// 后台服务协议版本；旧版守护进程没有这个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<u32>,
 }
 
 impl Response {
@@ -63,6 +82,7 @@ impl Response {
             ok: true,
             error: None,
             state: None,
+            protocol: Some(PROTOCOL_VERSION),
         }
     }
 
@@ -71,6 +91,7 @@ impl Response {
             ok: true,
             error: None,
             state: Some(state),
+            protocol: Some(PROTOCOL_VERSION),
         }
     }
 
@@ -79,6 +100,7 @@ impl Response {
             ok: false,
             error: Some(message.into()),
             state: None,
+            protocol: Some(PROTOCOL_VERSION),
         }
     }
 }
@@ -169,7 +191,7 @@ fn handle(req: Request, manager: &Manager) -> Response {
             opts,
         } => match Client::from_creds(&client) {
             Ok(client) => {
-                manager.enqueue(server, client, items, opts);
+                manager.enqueue(server, client, items, *opts);
                 Response::ok()
             }
             Err(e) => Response::err(format!("{e:#}")),
@@ -180,6 +202,30 @@ fn handle(req: Request, manager: &Manager) -> Response {
         }
         Request::CancelAll => {
             manager.cancel_all();
+            Response::ok()
+        }
+        Request::PauseServer { server } => {
+            if manager.snapshot().servers.contains_key(&server) {
+                manager.pause_server(&server);
+                Response::ok()
+            } else {
+                Response::err(format!("没有名为 {server} 的下载队列"))
+            }
+        }
+        Request::ResumeServer { server } => {
+            if manager.snapshot().servers.contains_key(&server) {
+                manager.resume_server(&server);
+                Response::ok()
+            } else {
+                Response::err(format!("没有名为 {server} 的下载队列"))
+            }
+        }
+        Request::PauseAll => {
+            manager.pause_all();
+            Response::ok()
+        }
+        Request::ResumeAll => {
+            manager.resume_all();
             Response::ok()
         }
         Request::ClearHistory => {
@@ -251,7 +297,23 @@ fn lock_is_stale(path: &Path) -> bool {
     let Ok(pid) = text.trim().parse::<u32>() else {
         return false;
     };
-    !Path::new(&format!("/proc/{pid}")).exists()
+    !process_is_running(pid)
+}
+
+/// 进程是否仍在运行。
+///
+/// 只检查 `/proc/{pid}` 是否存在不够：进程被 SIGTERM 结束后，父进程还没来得及
+/// 回收时会短暂变成僵尸（Z），此时 `/proc/{pid}` 仍然存在，会让新守护进程误判
+/// “已有实例在运行”而直接退出。
+fn process_is_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // 格式：`pid (comm) state ...`，comm 里可能有空格或括号，取最后一个 ')'。
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !rest.trim_start().starts_with('Z')
 }
 
 // ───────────────────────── 界面侧客户端 ─────────────────────────
@@ -299,7 +361,7 @@ impl DaemonHandle {
             server,
             client: client.creds(),
             items,
-            opts,
+            opts: Box::new(opts),
         });
     }
 
@@ -313,9 +375,60 @@ impl DaemonHandle {
         self.send(Request::CancelAll);
     }
 
+    pub fn pause_server(&self, server: &str) {
+        self.send(Request::PauseServer {
+            server: server.to_string(),
+        });
+    }
+
+    pub fn resume_server(&self, server: &str) {
+        self.send(Request::ResumeServer {
+            server: server.to_string(),
+        });
+    }
+
+    pub fn pause_all(&self) {
+        self.send(Request::PauseAll);
+    }
+
+    pub fn resume_all(&self) {
+        self.send(Request::ResumeAll);
+    }
+
     pub fn clear_finished(&self) {
         self.send(Request::ClearHistory);
     }
+}
+
+/// CLI：暂停后台下载队列；`server` 为 `None` 时暂停全部。
+pub async fn cli_pause(server: Option<&str>) -> Result<()> {
+    send_cli(match server {
+        Some(server) => Request::PauseServer {
+            server: server.to_string(),
+        },
+        None => Request::PauseAll,
+    })
+    .await
+}
+
+/// CLI：继续后台下载队列；`server` 为 `None` 时继续全部。
+pub async fn cli_resume(server: Option<&str>) -> Result<()> {
+    send_cli(match server {
+        Some(server) => Request::ResumeServer {
+            server: server.to_string(),
+        },
+        None => Request::ResumeAll,
+    })
+    .await
+}
+
+async fn send_cli(request: Request) -> Result<()> {
+    let mut conn = connect_daemon().await?;
+    let resp = conn.request(&request).await?;
+    if !resp.ok {
+        bail!(resp.error.unwrap_or_else(|| "后台服务返回未知错误".into()));
+    }
+    Ok(())
 }
 
 async fn connection_task(
@@ -346,17 +459,65 @@ fn set_error(slot: &Arc<Mutex<Option<String>>>, text: String) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
 }
 
+/// 与后台服务的一条连接（已完成协议握手）。
+struct Connection {
+    writer: OwnedWriteHalf,
+    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+}
+
+impl Connection {
+    async fn request(&mut self, request: &Request) -> Result<Response> {
+        let mut out = serde_json::to_vec(request).context("序列化请求失败")?;
+        out.push(b'\n');
+        self.writer
+            .write_all(&out)
+            .await
+            .context("发送请求到后台服务失败")?;
+        self.writer.flush().await.ok();
+
+        let line = tokio::time::timeout(Duration::from_secs(5), self.lines.next_line())
+            .await
+            .context("后台下载服务响应超时")??
+            .context("后台下载服务断开连接")?;
+        serde_json::from_str(&line).context("解析后台响应失败")
+    }
+}
+
+/// 连接后台服务并完成协议握手。
+///
+/// 0.0.3 及更早的守护进程没有 `protocol` 字段；检测到旧服务时先让它优雅退出
+/// （队列会落盘），再拉起当前版本并重连一次。
+async fn connect_daemon() -> Result<Connection> {
+    ensure_daemon().await?;
+    let socket = store::socket_path()?;
+    for attempt in 0..2 {
+        let stream = UnixStream::connect(&socket)
+            .await
+            .with_context(|| format!("连接 {} 失败", socket.display()))?;
+        let (reader, writer) = stream.into_split();
+        let mut conn = Connection {
+            writer,
+            lines: BufReader::new(reader).lines(),
+        };
+        let hello = conn.request(&Request::Ping).await?;
+        if hello.protocol == Some(PROTOCOL_VERSION) {
+            return Ok(conn);
+        }
+        drop(conn);
+        if attempt == 1 {
+            bail!("后台下载服务版本不匹配，请手动结束旧服务后重试");
+        }
+        stop_old_daemon().await?;
+        ensure_daemon().await?;
+    }
+    unreachable!("最多尝试两次连接")
+}
+
 async fn run_connection(
     rx: &mut mpsc::UnboundedReceiver<Request>,
     snapshot: &Arc<Mutex<Snapshot>>,
 ) -> Result<()> {
-    ensure_daemon().await?;
-    let socket = store::socket_path()?;
-    let stream = UnixStream::connect(&socket)
-        .await
-        .with_context(|| format!("连接 {} 失败", socket.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut conn = connect_daemon().await?;
 
     // 定期拉取快照；界面发来的命令优先处理。
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -366,19 +527,7 @@ async fn run_connection(
             _ = tick.tick() => Request::Snapshot,
             req = rx.recv() => req.context("界面已退出")?,
         };
-        let mut out = serde_json::to_vec(&request).context("序列化请求失败")?;
-        out.push(b'\n');
-        writer
-            .write_all(&out)
-            .await
-            .context("发送请求到后台服务失败")?;
-        writer.flush().await.ok();
-
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .context("后台下载服务响应超时")??
-            .context("后台下载服务断开连接")?;
-        let resp: Response = serde_json::from_str(&line).context("解析后台响应失败")?;
+        let resp = conn.request(&request).await?;
         if let Some(state) = resp.state {
             *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = state;
         }
@@ -407,6 +556,40 @@ async fn ensure_daemon() -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "daemon.log".into())
     )
+}
+
+/// 旧版本守护进程不认识暂停/继续命令：让它优雅退出，由调用方重新拉起。
+///
+/// SIGTERM 会让守护进程先保存队列，再删除 socket 与锁文件；正在运行的任务
+/// 在下次启动时回到队首并续传。
+async fn stop_old_daemon() -> Result<()> {
+    let lock = store::lock_path()?;
+    let text = std::fs::read_to_string(&lock)
+        .with_context(|| format!("读取后台服务锁 {} 失败", lock.display()))?;
+    let pid: u32 = text.trim().parse().context("后台服务锁内容不是有效 PID")?;
+
+    // 防止 PID 复用：只结束命令行确实是 embydown daemon 的进程。
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let cmdline = String::from_utf8_lossy(&cmdline);
+    if !cmdline.contains("embydown") || !cmdline.contains("daemon") {
+        bail!("检测到旧版后台服务（PID {pid}），但无法确认进程身份；请手动结束后重试");
+    }
+
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .context("发送 SIGTERM 失败")?;
+    if !status.success() {
+        bail!("结束旧版后台服务（PID {pid}）失败");
+    }
+    for _ in 0..60 {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("旧版后台服务（PID {pid}）未在 3 秒内退出")
 }
 
 /// 以独立进程组启动 `embydown daemon`：不随 TUI 一起被 Ctrl+C 结束。
@@ -456,7 +639,7 @@ mod tests {
                 direct_url: Some("http://host/x?api_key=k".into()),
                 ..Default::default()
             }],
-            opts: DownloadOpts::default(),
+            opts: Box::new(DownloadOpts::default()),
         };
         let text = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&text).unwrap();
@@ -475,11 +658,44 @@ mod tests {
         let text = serde_json::to_string(&Response::state(Snapshot::default())).unwrap();
         assert!(text.contains("\"ok\":true"));
         assert!(text.contains("\"state\""));
+        assert!(text.contains("\"protocol\":2"));
 
         let text = serde_json::to_string(&Response::err("boom")).unwrap();
         assert!(text.contains("\"ok\":false"));
         assert!(text.contains("boom"));
         assert!(!text.contains("\"state\""));
         assert!(!text.contains("\"error\":null"));
+    }
+
+    #[test]
+    fn pause_requests_round_trip() {
+        for req in [
+            Request::PauseAll,
+            Request::ResumeAll,
+            Request::PauseServer {
+                server: "srv".into(),
+            },
+            Request::ResumeServer {
+                server: "srv".into(),
+            },
+        ] {
+            let text = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&text).unwrap();
+            assert_eq!(text, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn old_daemon_response_has_no_protocol_field() {
+        // 0.0.3 的响应没有 protocol；TUI 据此判断需要重启后台服务。
+        let old: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(old.protocol, None);
+        assert_ne!(old.protocol, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn process_is_running_checks_proc_state() {
+        assert!(process_is_running(std::process::id()));
+        assert!(!process_is_running(u32::MAX));
     }
 }

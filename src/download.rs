@@ -283,6 +283,9 @@ pub struct DownloadOpts {
     pub overwrite: bool,
     pub subs: bool,
     pub dry_run: bool,
+    /// 精确目标文件：修复未完成任务时把下载写回原来的 `.part` 路径。
+    #[serde(default)]
+    pub fixed_dest: Option<PathBuf>,
 }
 
 impl Default for DownloadOpts {
@@ -297,6 +300,7 @@ impl Default for DownloadOpts {
             overwrite: false,
             subs: true,
             dry_run: false,
+            fixed_dest: None,
         }
     }
 }
@@ -1580,7 +1584,18 @@ pub async fn download_one(
         item,
         &item.ext(),
     );
-    let dest = opts.out.join(&rel);
+    // 修复未完成任务时直接写回原来的目标路径，才能复用已有的 .part 续传。
+    // 字幕命名只用到文件名部分，因此 fixed_dest 时用目标文件名代替模板路径。
+    let (dest, rel) = match &opts.fixed_dest {
+        Some(dest) => {
+            let name = dest
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel);
+            (dest.clone(), name)
+        }
+        None => (opts.out.join(&rel), rel),
+    };
 
     // 与 CLI 路径一致：同一目标路径串行，避免并发写同一个 .part。
     let Some(_dest_guard) = lock_dest_cancellable(&dest, cancel).await else {

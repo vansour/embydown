@@ -336,11 +336,23 @@ impl Client {
                 "Movie,Series,Episode,Video,Audio,MusicVideo".to_string(),
             ),
             ("Fields", FIELDS.to_string()),
-            ("SortBy", "SortName".to_string()),
         ];
-        self.query_items(&format!("/Users/{}/Items", self.user_id), &q, Some(limit))
+        // 服务器返回顺序可能是按名称而不是相关度，直接截断会把真正相关的条目挤掉。
+        // 先多取一些，在客户端按相关度排序后再截断到 limit。
+        let fetch = limit.saturating_mul(4).min(400).max(limit);
+        let mut items = self
+            .query_items(&format!("/Users/{}/Items", self.user_id), &q, Some(fetch))
             .await
-            .context("搜索失败")
+            .context("搜索失败")?;
+        items.sort_by_cached_key(|item| {
+            (
+                std::cmp::Reverse(item.search_score(term)),
+                item.title().chars().count(),
+                item.title().to_lowercase(),
+            )
+        });
+        items.truncate(limit as usize);
+        Ok(items)
     }
 
     /// 直链候选列表：优先静态直链（对非管理员账号权限要求最低），再回退官方 Download。

@@ -8,6 +8,7 @@ mod emby;
 mod manager;
 mod model;
 mod naming;
+mod repair;
 mod store;
 mod table;
 mod tui;
@@ -46,6 +47,22 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Ui => tui::run().await,
         Cmd::Daemon => daemon::run().await,
         Cmd::History { limit } => print_history(limit),
+        Cmd::Pause { server } => {
+            daemon::cli_pause(server.as_deref()).await?;
+            match &server {
+                Some(name) => println!("已暂停 {name} 的下载队列"),
+                None => println!("已暂停所有服务器的下载队列"),
+            }
+            Ok(())
+        }
+        Cmd::Resume { server } => {
+            daemon::cli_resume(server.as_deref()).await?;
+            match &server {
+                Some(name) => println!("已继续 {name} 的下载队列"),
+                None => println!("已继续所有服务器的下载队列"),
+            }
+            Ok(())
+        }
         Cmd::Login(args) => login(args).await,
         Cmd::Logout { name } => logout(name),
         Cmd::Servers => list_servers(),
@@ -467,12 +484,20 @@ async fn run_command(cmd: Cmd) -> Result<()> {
                 overwrite,
                 subs,
                 dry_run,
+                fixed_dest: None,
             };
             download::execute(&client, items, opts).await?;
         }
 
-        Cmd::Login(_) | Cmd::Logout { .. } | Cmd::Servers | Cmd::Ui | Cmd::Daemon | Cmd::History { .. } => {
-            unreachable!("login/logout/servers/ui/daemon/history 已在 run() 中处理")
+        Cmd::Login(_)
+        | Cmd::Logout { .. }
+        | Cmd::Servers
+        | Cmd::Ui
+        | Cmd::Daemon
+        | Cmd::History { .. }
+        | Cmd::Pause { .. }
+        | Cmd::Resume { .. } => {
+            unreachable!("login/logout/servers/ui/daemon/history/pause/resume 已在 run() 中处理")
         }
     }
 
@@ -530,13 +555,14 @@ async fn preview_matches(
     }
 
     // 3) 当关键字搜索
-    let mut rows: Vec<SearchRow> = Vec::new();
+    let mut hits: Vec<(i64, String, Client, Item)> = Vec::new();
     let mut failed = 0usize;
     for (name, client) in clients {
         match client.search(target, limit).await {
             Ok(items) => {
                 for item in items {
-                    rows.extend(search_rows(&name, &client, item).await);
+                    let score = item.search_score(target);
+                    hits.push((score, name.clone(), client.clone(), item));
                 }
             }
             Err(e) => {
@@ -544,6 +570,20 @@ async fn preview_matches(
                 eprintln!("⚠️  {name} 搜索失败: {e:#}");
             }
         }
+    }
+
+    // 跨服务器的结果统一按相关度排序，再展开成预览行。
+    hits.sort_by_cached_key(|(score, name, _, item)| {
+        (
+            std::cmp::Reverse(*score),
+            item.title().chars().count(),
+            item.title().to_lowercase(),
+            name.clone(),
+        )
+    });
+    let mut rows: Vec<SearchRow> = Vec::new();
+    for (_, name, client, item) in hits {
+        rows.extend(search_rows(&name, &client, item).await);
     }
 
     if rows.is_empty() {
@@ -1072,6 +1112,15 @@ async fn search_clients(
             Err(e) => eprintln!("⚠️  {name} 搜索失败: {e:#}"),
         }
     }
+    // 合并多服务器结果后按相关度排序，ID 找不到时的自动选择也依赖这个顺序。
+    found.sort_by_cached_key(|(name, _, item)| {
+        (
+            std::cmp::Reverse(item.search_score(&keyword)),
+            item.title().chars().count(),
+            item.title().to_lowercase(),
+            name.clone(),
+        )
+    });
     found
 }
 

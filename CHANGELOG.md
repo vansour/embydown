@@ -1,7 +1,27 @@
 # 变更记录
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
-发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.3` ↔ `0.0.3`）。
+发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.4` ↔ `0.0.4`）。
+
+## [0.0.4] - 2026-10-30
+
+### 新增
+
+- 下载队列支持暂停/继续：TUI 下载页按 `p` 暂停/继续当前服务器，`P` 暂停/继续全部；
+  也可用 CLI `embydown pause` / `embydown resume`（`--server <别名>` 只作用于单个服务器）。
+  暂停时正在运行的任务会放回队首并保留 `.part`，继续后从断点续传；暂停状态写入 `queue.json`，
+  后台服务重启后仍然保持。
+- 未完成任务找回（TUI 下载页 `r`）：递归扫描下载目录中的 `.part` / `.part.json`，
+  从文件名推导关键字并在所有服务器搜索；剧集会自动展开容器并匹配同一季集。
+  选择来源后写回原文件路径，复用已有 `.part` 断点续传。
+- 后台服务协议握手：TUI 检测到旧版守护进程（0.0.3 及更早）时会先让它优雅退出，
+  再拉起当前版本，避免升级后暂停/继续命令不可用。
+
+### 变更
+
+- 搜索结果改为按相关度排序（标题完全匹配 > 前缀 > 包含 > 剧名/路径匹配），
+  多个服务器的结果合并后统一排序；不再受服务器按名称返回的顺序影响。
+  服务器端会多取一些候选再在客户端排序截断，避免按名称排序时把相关条目挤掉。
 
 ## [0.0.3] - 2026-10-30
 
@@ -54,6 +74,7 @@
 - 一键安装脚本 `install.sh`。
 - GitHub Actions：CI 与 tag 发布 Release。
 
+[0.0.4]: https://github.com/vansour/embydown/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/vansour/embydown/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/vansour/embydown/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/vansour/embydown/releases/tag/v0.0.1

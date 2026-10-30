@@ -27,6 +27,7 @@ use crate::download::DownloadOpts;
 use crate::manager::FinishedStatus;
 use crate::emby::Client;
 use crate::model::Item;
+use crate::repair;
 use crate::util::{format_bytes, parse_rate};
 use crate::{
     expand_versions, filter_to_version, has_multiple_versions, resolve_item, version_summaries,
@@ -280,6 +281,67 @@ enum Modal {
     Message(String, bool),
     Help,
     Loading(String),
+    /// 未完成任务：扫描下载目录并给出可选的来源。
+    Unfinished(Box<UnfinishedState>),
+}
+
+/// 未完成任务弹窗状态。
+struct UnfinishedState {
+    result: repair::ScanResult,
+    /// 选中的候选来源（在所有候选里的扁平序号）。
+    selected: usize,
+}
+
+impl UnfinishedState {
+    fn new(result: repair::ScanResult) -> Self {
+        Self {
+            result,
+            selected: 0,
+        }
+    }
+
+    /// 扁平候选列表：`(任务下标, 候选下标)`。
+    fn options(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (ti, task) in self.result.tasks.iter().enumerate() {
+            for ci in 0..task.candidates.len() {
+                out.push((ti, ci));
+            }
+        }
+        out
+    }
+
+    fn option_count(&self) -> usize {
+        self.result
+            .tasks
+            .iter()
+            .map(|t| t.candidates.len())
+            .sum()
+    }
+
+    fn selected_option(&self) -> Option<(usize, usize)> {
+        self.options().get(self.selected).copied()
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        let count = self.option_count();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let next = (self.selected as isize + delta).clamp(0, count as isize - 1);
+        self.selected = next as usize;
+    }
+
+    /// 删除任务后把选中项收敛到有效范围。
+    fn clamp(&mut self) {
+        let count = self.option_count();
+        self.selected = if count == 0 {
+            0
+        } else {
+            self.selected.min(count - 1)
+        };
+    }
 }
 
 enum Msg {
@@ -301,6 +363,10 @@ enum Msg {
         seq: u64,
         /// (别名, 客户端, 覆盖同名服务器的警告)
         result: Result<(String, Client, Option<String>), String>,
+    },
+    Unfinished {
+        seq: u64,
+        result: Result<repair::ScanResult, String>,
     },
 }
 
@@ -335,6 +401,7 @@ struct App {
     seq: u64,
     prepare_seq: Option<u64>,
     login_seq: Option<u64>,
+    unfinished_seq: Option<u64>,
 }
 
 impl App {
@@ -374,6 +441,7 @@ impl App {
             seq: 0,
             prepare_seq: None,
             login_seq: None,
+            unfinished_seq: None,
         }
     }
 
@@ -516,6 +584,31 @@ impl App {
                     }
                     Err(err) => {
                         self.modal = Modal::Message(format!("登录失败：{err}"), true);
+                    }
+                }
+            }
+            Msg::Unfinished { seq, result } => {
+                if self.unfinished_seq != Some(seq) {
+                    return;
+                }
+                self.unfinished_seq = None;
+                match result {
+                    Err(err) => {
+                        self.modal = Modal::Message(format!("扫描未完成任务失败：{err}"), true);
+                    }
+                    Ok(result) if result.tasks.is_empty() => {
+                        self.modal =
+                            Modal::Message("下载目录里没有未完成任务".to_string(), false);
+                    }
+                    Ok(result) => {
+                        let shown = result.tasks.len();
+                        let total = result.total;
+                        self.modal = Modal::Unfinished(Box::new(UnfinishedState::new(result)));
+                        if total > shown {
+                            self.set_warn(format!(
+                                "共 {total} 个未完成任务，先显示前 {shown} 个"
+                            ));
+                        }
                     }
                 }
             }
@@ -768,13 +861,82 @@ impl App {
                 self.daemon.cancel_all();
                 self.set_warn("已取消所有服务器的下载");
             }
+            KeyCode::Char('p') => {
+                let selected = {
+                    let st = self.daemon.state();
+                    let idx = self.downloads.selected().unwrap_or(0);
+                    st.servers
+                        .iter()
+                        .nth(idx)
+                        .map(|(name, ss)| (name.clone(), ss.paused))
+                };
+                if let Some((name, paused)) = selected {
+                    if paused {
+                        self.daemon.resume_server(&name);
+                        self.set_ok(format!("已继续 {name} 的下载队列"));
+                    } else {
+                        self.daemon.pause_server(&name);
+                        self.set_warn(format!("已暂停 {name} 的下载队列（按 p 继续）"));
+                    }
+                }
+            }
+            KeyCode::Char('P') => {
+                let all_paused = {
+                    let st = self.daemon.state();
+                    !st.servers.is_empty() && st.servers.values().all(|ss| ss.paused)
+                };
+                if all_paused {
+                    self.daemon.resume_all();
+                    self.set_ok("已继续所有服务器的下载");
+                } else {
+                    self.daemon.pause_all();
+                    self.set_warn("已暂停所有服务器的下载（按 P 继续）");
+                }
+            }
             KeyCode::Char('c') => {
                 self.daemon.clear_finished();
                 self.set_info("已清空下载历史（记录文件也会删除）");
             }
+            KeyCode::Char('r') => self.start_unfinished_scan(),
             _ => {}
         }
         Ok(())
+    }
+
+    /// 扫描下载目录里的未完成任务，并为每个任务搜索可用的来源。
+    fn start_unfinished_scan(&mut self) {
+        if self.unfinished_seq.is_some() {
+            self.set_warn("正在扫描未完成任务…");
+            return;
+        }
+        let out = self.settings.out.trim();
+        let out = if out.is_empty() { "./downloads" } else { out };
+        let out = match crate::util::expand_tilde(Path::new(out)) {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        if self.clients.is_empty() {
+            self.set_error("没有可用的服务器，请先在「服务器」页登录");
+            return;
+        }
+        let seq = self.next_seq();
+        self.unfinished_seq = Some(seq);
+        self.modal = Modal::Loading("扫描未完成任务并搜索来源…".into());
+        let clients: Vec<(String, Client)> = self
+            .clients
+            .iter()
+            .map(|(name, client)| (name.clone(), client.clone()))
+            .collect();
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            let result = repair::scan_and_search(&out, &clients)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Unfinished { seq, result });
+        });
     }
 
     fn adjust_setting(&mut self, delta: isize) {
@@ -889,11 +1051,14 @@ impl App {
                     Err(e) => errors.push(format!("{name}: {e:#}")),
                 }
             }
-            hits.sort_by(|a, b| {
-                a.item
-                    .title()
-                    .cmp(&b.item.title())
-                    .then_with(|| a.server.cmp(&b.server))
+            // 按相关度排序（服务器返回的可能是名称顺序）；同分时短标题优先。
+            hits.sort_by_cached_key(|h| {
+                (
+                    std::cmp::Reverse(h.item.search_score(&term)),
+                    h.item.title().chars().count(),
+                    h.item.title().to_lowercase(),
+                    h.server.clone(),
+                )
             });
             let _ = tx.send(Msg::Searched { seq, hits, errors });
         });
@@ -1120,6 +1285,7 @@ impl App {
             overwrite: self.settings.overwrite,
             subs: self.settings.subs,
             dry_run: false,
+            fixed_dest: None,
         })
     }
 
@@ -1422,6 +1588,73 @@ impl App {
                     self.modal = Modal::Detail;
                 }
             }
+            Modal::Unfinished(mut state) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up => {
+                    state.move_by(-1);
+                    self.modal = Modal::Unfinished(state);
+                }
+                KeyCode::Down => {
+                    state.move_by(1);
+                    self.modal = Modal::Unfinished(state);
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    if let Some((ti, _)) = state.selected_option() {
+                        state.result.tasks.remove(ti);
+                        state.clamp();
+                    }
+                    if state.result.tasks.is_empty() {
+                        self.set_info("已跳过全部未完成任务");
+                        self.modal = Modal::None;
+                    } else {
+                        self.modal = Modal::Unfinished(state);
+                    }
+                }
+                KeyCode::Enter => {
+                    let Some((ti, ci)) = state.selected_option() else {
+                        self.modal = Modal::Unfinished(state);
+                        return Ok(());
+                    };
+                    let (server, item, dest) = {
+                        let task = &state.result.tasks[ti];
+                        let candidate = &task.candidates[ci];
+                        (
+                            candidate.server.clone(),
+                            candidate.item.clone(),
+                            task.file.dest.clone(),
+                        )
+                    };
+                    let Some(client) = self.clients.get(&server).cloned() else {
+                        self.set_error(format!("服务器 {server} 未连接"));
+                        self.modal = Modal::Unfinished(state);
+                        return Ok(());
+                    };
+                    match self.build_opts() {
+                        Ok(mut opts) => {
+                            // 写回原来的目标路径，复用已有的 .part 续传。
+                            opts.fixed_dest = Some(dest.clone());
+                            self.daemon.enqueue(server, client, vec![item.clone()], opts);
+                            self.set_ok(format!(
+                                "已加入队列：{} → {}",
+                                item.title(),
+                                dest.display()
+                            ));
+                            state.result.tasks.remove(ti);
+                            state.clamp();
+                            if state.result.tasks.is_empty() {
+                                self.modal = Modal::None;
+                            } else {
+                                self.modal = Modal::Unfinished(state);
+                            }
+                        }
+                        Err(e) => {
+                            self.set_error(format!("{e:#}"));
+                            self.modal = Modal::Unfinished(state);
+                        }
+                    }
+                }
+                _ => self.modal = Modal::Unfinished(state),
+            },
         }
         Ok(())
     }
@@ -1530,7 +1763,7 @@ impl App {
                 "↑↓ 选择 · Enter 进入/下载 · d 直接下载 · Backspace 返回 · Tab 切页 · q 退出"
             }
             (Tab::Downloads, _) => {
-                "↑↓ 选择服务器 · x 取消该服务器 · X 取消全部 · c 清空历史 · Tab 切页 · q 退出"
+                "↑↓ 选择 · x 取消 · X 全部 · p/P 暂停 · r 未完成任务 · Tab 切页 · q 退出"
             }
             (Tab::Servers, _) => {
                 "↑↓ 选择 · Enter 设为搜索范围 · l 浏览 · a 登录 · d 删除 · Tab 切页 · q 退出"
@@ -1702,7 +1935,7 @@ impl App {
                 total_active += ss.active.len();
                 total_queue += ss.queue.len();
                 let mark = if idx == selected { "▶" } else { " " };
-                lines.push(Line::from(vec![
+                let mut head = vec![
                     Span::styled(format!("{mark} "), accent()),
                     Span::styled(
                         name.clone(),
@@ -1710,21 +1943,28 @@ impl App {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!(
-                            "  运行 {} · 排队 {} · 完成 {} · 跳过 {} · 失败 {} · 取消 {} · 字幕 {} · {}",
-                            ss.active.len(),
-                            ss.queue.len(),
-                            ss.done,
-                            ss.skipped,
-                            ss.failed,
-                            ss.cancelled,
-                            ss.subs,
-                            format_bytes(ss.bytes)
-                        ),
-                        Style::default().fg(Color::Gray),
+                ];
+                if ss.paused {
+                    head.push(Span::styled(
+                        "  ⏸ 已暂停",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                head.push(Span::styled(
+                    format!(
+                        "  运行 {} · 排队 {} · 完成 {} · 跳过 {} · 失败 {} · 取消 {} · 字幕 {} · {}",
+                        ss.active.len(),
+                        ss.queue.len(),
+                        ss.done,
+                        ss.skipped,
+                        ss.failed,
+                        ss.cancelled,
+                        ss.subs,
+                        format_bytes(ss.bytes)
                     ),
-                ]));
+                    Style::default().fg(Color::Gray),
+                ));
+                lines.push(Line::from(head));
                 for a in &ss.active {
                     let pos = a.position;
                     let len = a.length;
@@ -2143,12 +2383,28 @@ impl App {
                 let block = Block::default().borders(Borders::ALL).title(" 选择季 ");
                 f.render_widget(Paragraph::new(lines).block(block), area);
             }
+            Modal::Unfinished(state) => self.draw_unfinished(f, state),
             Modal::Detail => {
                 if let Some(d) = &self.detail {
                     self.draw_detail(f, d);
                 }
             }
         }
+    }
+
+    fn draw_unfinished(&self, f: &mut Frame, state: &UnfinishedState) {
+        let area = centered(96, 88, f.area());
+        f.render_widget(Clear, area);
+        let (items, selectable) = unfinished_items(state);
+        let mut list_state =
+            ListState::default().with_selected(selectable.get(state.selected).copied());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" 未完成任务 ");
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(Color::DarkGray));
+        f.render_stateful_widget(list, area, &mut list_state);
     }
 
     fn draw_detail(&self, f: &mut Frame, d: &Detail) {
@@ -2327,6 +2583,129 @@ impl App {
             Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
             area,
         );
+    }
+}
+
+// ───────────────────────── 未完成任务弹窗 ─────────────────────────
+
+/// 构建未完成任务弹窗的行，以及其中可作为候选来源的行号。
+fn unfinished_items(state: &UnfinishedState) -> (Vec<ListItem<'static>>, Vec<usize>) {
+    let mut items = Vec::new();
+    let mut selectable = Vec::new();
+
+    items.push(ListItem::new(Line::from(Span::styled(
+        "↑↓ 选择来源 · Enter 下载到原文件（断点续传）· d 跳过任务 · Esc 关闭",
+        Style::default().fg(Color::DarkGray),
+    ))));
+    if state.result.total > state.result.tasks.len() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "共 {} 个未完成任务，当前显示前 {} 个",
+                state.result.total,
+                state.result.tasks.len()
+            ),
+            Style::default().fg(Color::Yellow),
+        ))));
+    }
+    items.push(ListItem::new(Line::from("")));
+
+    for task in &state.result.tasks {
+        let name = task
+            .file
+            .dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| task.file.dest.display().to_string());
+        let parent = task
+            .file
+            .dest
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("▶ ", accent()),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  已下载 {}", format_bytes(task.file.partial_bytes)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  关键字 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(task.file.keyword.clone(), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("  ·  {parent}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])));
+
+        if task.candidates.is_empty() {
+            let mut text = "  未找到可用来源".to_string();
+            if let Some(err) = task.errors.first() {
+                text.push_str(&format!("（{err}）"));
+            }
+            items.push(ListItem::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Red),
+            ))));
+        } else {
+            for candidate in &task.candidates {
+                selectable.push(items.len());
+                let year = candidate
+                    .item
+                    .production_year
+                    .map(|y| format!(" ({y})"))
+                    .unwrap_or_default();
+                let size = candidate
+                    .item
+                    .size()
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "-".into());
+                let sources = candidate
+                    .item
+                    .media_sources
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let mut meta = format!("{} · {}", candidate.item.display_type(), size);
+                if sources > 1 {
+                    meta.push_str(&format!(" · {sources} 个版本"));
+                }
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("   [{}] ", candidate.server),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(format!("{}{year}", candidate_label(&candidate.item))),
+                    Span::styled(
+                        format!("  {meta}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])));
+            }
+        }
+        items.push(ListItem::new(Line::from("")));
+    }
+
+    (items, selectable)
+}
+
+fn candidate_label(item: &Item) -> String {
+    if item.item_type.as_deref() == Some("Episode") {
+        let series = item.series_name.clone().unwrap_or_default();
+        format!(
+            "{series} - S{:02}E{:02} {}",
+            item.season_no(),
+            item.episode_no(),
+            item.title()
+        )
+    } else {
+        item.title()
     }
 }
 
@@ -2629,7 +3008,13 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled("下载队列", accent())),
         key("↑↓", "选择服务器"),
         key("x / X", "取消当前服务器的队列 / 取消全部"),
+        key("p / P", "暂停/继续当前服务器（P 暂停/继续全部）"),
+        key("r", "扫描下载目录中的未完成任务，搜索并选择下载源"),
         key("c", "清空最近完成记录（并删除历史文件）"),
+        Line::from(Span::styled(
+            "  暂停会保留已下载分块；继续或重新加入同一任务时自动续传。",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(Span::styled(
             "  下载由独立的后台服务执行，关闭界面/终端不会中断，下次打开可继续查看。",
             Style::default().fg(Color::DarkGray),

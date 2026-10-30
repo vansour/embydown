@@ -38,6 +38,9 @@ pub struct PersistedServer {
     pub creds: Option<ClientCreds>,
     #[serde(default)]
     pub max_jobs: usize,
+    /// 用户暂停状态：恢复后保持暂停，直到手动继续。
+    #[serde(default)]
+    pub paused: bool,
     #[serde(default)]
     pub queue: Vec<JobRecord>,
     /// 退出/崩溃时正在运行的任务；恢复时放回队列头部重新执行。
@@ -290,6 +293,7 @@ mod tests {
                     insecure: true,
                 }),
                 max_jobs: 3,
+                paused: true,
                 queue: vec![job(8)],
                 active: vec![job(9)],
                 done: 1,
@@ -307,6 +311,7 @@ mod tests {
         assert!(srv.queue[0].item.source_locked);
         assert_eq!(srv.active[0].id, 9);
         assert_eq!(srv.bytes, 42);
+        assert!(srv.paused);
         assert!(srv.creds.as_ref().unwrap().insecure);
 
         // 队列里可能有 api_key，权限必须是 0600。

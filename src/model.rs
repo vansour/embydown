@@ -114,6 +114,75 @@ impl Item {
         self.name.clone().unwrap_or_else(|| "untitled".into())
     }
 
+    /// 搜索结果相关性评分（越大越相关）。
+    ///
+    /// 服务器返回顺序并不可靠（有的按名称排序），合并多个服务器的结果后更需要
+    /// 统一排序。规则从高到低：标题完全匹配、标题前缀、标题包含（越靠前越高）、
+    /// 剧名匹配、路径匹配。多词查询会把每个词的命中累加，所有词都命中标题时
+    /// 额外加分。比较前会去掉空格和标点，因此 `spider man` 也能命中 `Spider-Man`。
+    pub fn search_score(&self, term: &str) -> i64 {
+        let norm_term = normalize_search(term);
+        if norm_term.is_empty() {
+            return 0;
+        }
+        let title = normalize_search(&self.title());
+        let series = normalize_search(self.series_name.as_deref().unwrap_or_default());
+        let path = normalize_search(
+            self.path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|f| f.to_str())
+                .unwrap_or_default(),
+        );
+
+        let mut score = 0;
+        if title == norm_term {
+            score += 5000;
+        } else if title.starts_with(&norm_term) {
+            score += 2500;
+        } else if let Some(byte_pos) = title.find(&norm_term) {
+            // 越靠前越相关，最多扣 600 分。
+            let pos = title[..byte_pos].chars().count() as i64;
+            score += 1200 - (pos * 4).min(600);
+        }
+
+        if series == norm_term {
+            score += 600;
+        } else if series.starts_with(&norm_term) {
+            score += 300;
+        } else if series.contains(&norm_term) {
+            score += 120;
+        }
+        if path.contains(&norm_term) {
+            score += 60;
+        }
+
+        // 多词查询：逐词累加，全部命中标题时再给一笔较大的加分。
+        let tokens: Vec<String> = term
+            .split_whitespace()
+            .map(normalize_search)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.len() > 1 {
+            let mut in_title = 0;
+            for token in &tokens {
+                if title.contains(token) {
+                    score += 150;
+                    in_title += 1;
+                } else if series.contains(token) {
+                    score += 50;
+                } else if path.contains(token) {
+                    score += 15;
+                }
+            }
+            if in_title == tokens.len() {
+                score += 400;
+            }
+        }
+
+        score
+    }
+
     pub fn season_no(&self) -> i32 {
         if let Some(n) = self.parent_index_number {
             return n;
@@ -152,8 +221,16 @@ impl Item {
     }
 }
 
+/// 搜索比较用的归一化：转小写并去掉空格、标点（保留字母、数字与中文）。
+fn normalize_search(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// 从路径文件名解析 `SxxEyy`。
-fn parse_season_episode(path: &str) -> Option<(i32, i32)> {
+pub(crate) fn parse_season_episode(path: &str) -> Option<(i32, i32)> {
     let file = path.rsplit(['/', '\\']).next()?;
     let bytes = file.as_bytes();
     let mut i = 0;
@@ -273,4 +350,69 @@ impl AuthRequest {
 pub struct Probe {
     pub total: Option<u64>,
     pub range_supported: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(name: &str) -> Item {
+        Item {
+            name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_score_exact_then_prefix_then_contains() {
+        let exact = named("阿凡达").search_score("阿凡达");
+        let prefix = named("阿凡达：水之道").search_score("阿凡达");
+        let contains = named("你好，阿凡达").search_score("阿凡达");
+        let unrelated = named("别的电影").search_score("阿凡达");
+
+        assert!(exact > prefix, "{exact} vs {prefix}");
+        assert!(prefix > contains, "{prefix} vs {contains}");
+        assert!(contains > unrelated, "{contains} vs {unrelated}");
+        assert_eq!(unrelated, 0);
+    }
+
+    #[test]
+    fn search_score_ignores_spaces_and_punctuation() {
+        let item = named("Spider-Man");
+        assert!(item.search_score("spider man") >= 5000);
+        assert_eq!(named("蜘蛛侠").search_score("Spider-Man"), 0);
+    }
+
+    #[test]
+    fn search_score_uses_series_name_but_prefers_title() {
+        let series = Item {
+            name: Some("庆余年".into()),
+            item_type: Some("Series".into()),
+            ..Default::default()
+        };
+        let episode = Item {
+            name: Some("第一集".into()),
+            series_name: Some("庆余年".into()),
+            ..Default::default()
+        };
+        assert!(series.search_score("庆余年") > episode.search_score("庆余年"));
+        assert!(episode.search_score("庆余年") > 0);
+    }
+
+    #[test]
+    fn search_score_rewards_multi_word_title_hits() {
+        let item = named("The Lord of the Rings");
+        assert!(item.search_score("lord rings") > named("Ring").search_score("lord rings"));
+        assert!(item.search_score("lord rings") > 0);
+    }
+
+    #[test]
+    fn search_score_falls_back_to_path() {
+        let item = Item {
+            name: Some("第一集".into()),
+            path: Some("/media/庆余年/Season 01/庆余年 - S01E01.mkv".into()),
+            ..Default::default()
+        };
+        assert!(item.search_score("庆余年") > 0);
+    }
 }

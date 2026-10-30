@@ -41,6 +41,8 @@ pub struct ServerState {
     pub subs: usize,
     pub bytes: u64,
     pub stop_requested: bool,
+    /// 用户暂停：不再派发新任务，正在运行的任务已放回队首（保留 .part）。
+    pub paused: bool,
     /// 重建后台任务用的连接参数（随队列一起落盘）。
     creds: Option<ClientCreds>,
 }
@@ -83,12 +85,14 @@ pub struct Finished {
 
 /// 守护进程每秒推给 TUI 的状态。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     pub servers: BTreeMap<String, ServerView>,
     pub finished: Vec<Finished>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerView {
     pub queue: Vec<QueueView>,
     pub active: Vec<ActiveView>,
@@ -99,6 +103,7 @@ pub struct ServerView {
     pub skipped: usize,
     pub subs: usize,
     pub bytes: u64,
+    pub paused: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -126,6 +131,10 @@ enum Cmd {
     Enqueue(Box<EnqueueCmd>),
     CancelServer(String),
     CancelAll,
+    PauseServer(String),
+    ResumeServer(String),
+    PauseAll,
+    ResumeAll,
     ClearFinished,
     Completed {
         server: String,
@@ -174,6 +183,22 @@ impl Manager {
 
     pub fn cancel_all(&self) {
         let _ = self.tx.send(Cmd::CancelAll);
+    }
+
+    pub fn pause_server(&self, server: &str) {
+        let _ = self.tx.send(Cmd::PauseServer(server.to_string()));
+    }
+
+    pub fn resume_server(&self, server: &str) {
+        let _ = self.tx.send(Cmd::ResumeServer(server.to_string()));
+    }
+
+    pub fn pause_all(&self) {
+        let _ = self.tx.send(Cmd::PauseAll);
+    }
+
+    pub fn resume_all(&self) {
+        let _ = self.tx.send(Cmd::ResumeAll);
     }
 
     pub fn clear_finished(&self) {
@@ -232,6 +257,7 @@ fn snapshot_of(st: &ManagerState) -> Snapshot {
                     skipped: ss.skipped,
                     subs: ss.subs,
                     bytes: ss.bytes,
+                    paused: ss.paused,
                 };
                 (name.clone(), view)
             })
@@ -274,6 +300,7 @@ fn persisted(st: &ManagerState) -> PersistedState {
                     skipped: ss.skipped,
                     subs: ss.subs,
                     bytes: ss.bytes,
+                    paused: ss.paused,
                 };
                 (name.clone(), server)
             })
@@ -331,6 +358,7 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
                     subs: ps.subs,
                     bytes: ps.bytes,
                     stop_requested: false,
+                    paused: ps.paused,
                     creds,
                 },
             );
@@ -369,6 +397,28 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
         );
     }
     had_state
+}
+
+/// 暂停时把运行中的任务放回队首。
+///
+/// 旧任务收到取消标记后会尽快退出；它们的 `Completed` 消息因为 `active`
+/// 里已经没有对应 id 而被忽略，不写入历史，也不会增加失败/取消计数。
+/// `.part` 与状态文件保留，继续时会从这里续传。
+fn requeue_active(ss: &mut ServerState) {
+    let mut jobs: Vec<PendingJob> = ss
+        .active
+        .drain(..)
+        .map(|a| PendingJob {
+            id: a.id,
+            title: a.title,
+            item: a.item,
+            opts: a.opts,
+        })
+        .collect();
+    // 倒序 push_front，保持原本的排队顺序。
+    while let Some(job) = jobs.pop() {
+        ss.queue.push_front(job);
+    }
 }
 
 async fn run(
@@ -445,6 +495,7 @@ async fn run(
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ss) = st.servers.get_mut(&server) {
                     ss.stop_requested = true;
+                    ss.paused = false;
                     ss.queue.clear();
                 }
                 drop(st);
@@ -457,9 +508,66 @@ async fn run(
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 for ss in st.servers.values_mut() {
                     ss.stop_requested = true;
+                    ss.paused = false;
                     ss.queue.clear();
                 }
                 drop(st);
+                dirty = true;
+            }
+            Cmd::PauseServer(server) => {
+                if let Some(c) = ctx.get(&server) {
+                    c.cancel.store(true, Ordering::SeqCst);
+                }
+                {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ss) = st.servers.get_mut(&server)
+                        && !ss.paused
+                    {
+                        ss.paused = true;
+                        requeue_active(ss);
+                    }
+                }
+                dirty = true;
+            }
+            Cmd::ResumeServer(server) => {
+                {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ss) = st.servers.get_mut(&server) {
+                        ss.paused = false;
+                        ss.stop_requested = false;
+                    }
+                }
+                if let Some(c) = ctx.get_mut(&server) {
+                    // 旧的取消标记已经被暂停时放回队首的任务继承；继续时换一个新的。
+                    c.cancel = Arc::new(AtomicBool::new(false));
+                }
+                dirty = true;
+            }
+            Cmd::PauseAll => {
+                for c in ctx.values() {
+                    c.cancel.store(true, Ordering::SeqCst);
+                }
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                for ss in st.servers.values_mut() {
+                    if !ss.paused {
+                        ss.paused = true;
+                        requeue_active(ss);
+                    }
+                }
+                drop(st);
+                dirty = true;
+            }
+            Cmd::ResumeAll => {
+                {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    for ss in st.servers.values_mut() {
+                        ss.paused = false;
+                        ss.stop_requested = false;
+                    }
+                }
+                for c in ctx.values_mut() {
+                    c.cancel = Arc::new(AtomicBool::new(false));
+                }
                 dirty = true;
             }
             Cmd::ClearFinished => {
@@ -565,6 +673,10 @@ fn dispatch(
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         for (server, ss) in st.servers.iter_mut() {
             let Some(c) = ctx.get(server) else { continue };
+            // 用户暂停后不派发新任务；继续时由 update 循环重新触发。
+            if ss.paused {
+                continue;
+            }
             // 服务器处在长时间限流窗口内时不要继续派发，否则任务会立刻失败。
             if download::server_rate_limited(&c.client.server).is_some() {
                 continue;
@@ -628,4 +740,52 @@ fn dispatch(
         });
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(id: u64) -> PendingJob {
+        PendingJob {
+            id,
+            title: format!("任务 {id}"),
+            item: Item {
+                id: format!("item{id}"),
+                ..Default::default()
+            },
+            opts: DownloadOpts::default(),
+        }
+    }
+
+    fn active(id: u64) -> ActiveJob {
+        ActiveJob {
+            id,
+            title: format!("任务 {id}"),
+            pb: ProgressBar::hidden(),
+            started: Instant::now(),
+            item: Item {
+                id: format!("item{id}"),
+                ..Default::default()
+            },
+            opts: DownloadOpts::default(),
+        }
+    }
+
+    #[test]
+    fn pausing_requeues_active_jobs_in_order() {
+        let mut ss = ServerState::default();
+        ss.queue.push_back(pending(3));
+        ss.active.push(active(1));
+        ss.active.push(active(2));
+        ss.paused = true;
+
+        requeue_active(&mut ss);
+
+        // 运行中的任务放回队首，并保持原本顺序；暂停状态不变。
+        assert!(ss.active.is_empty());
+        let ids: Vec<u64> = ss.queue.iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(ss.paused);
+    }
 }
