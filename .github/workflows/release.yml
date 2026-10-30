@@ -53,10 +53,40 @@ jobs:
 
           ls -lh dist/
 
+      - name: Extract release notes from CHANGELOG
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          PREV="$prev" python3 - <<'PY'
+          import os
+          import re
+
+          version = os.environ["VERSION"].removeprefix("v")
+          repo = os.environ["REPO"]
+          prev = os.environ.get("PREV", "")
+
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          match = re.search(pattern, text, re.M | re.S)
+          if not match:
+              raise SystemExit(f"CHANGELOG.md 中找不到版本 {version} 的章节")
+
+          body = match.group(1).strip()
+          body += "\n\n"
+          if prev:
+              body += f"**Full Changelog**: https://github.com/{repo}/compare/{prev}...v{version}\n"
+          body += f"**完整变更记录**: https://github.com/{repo}/blob/main/CHANGELOG.md\n"
+          with open("release-notes.md", "w", encoding="utf-8") as f:
+              f.write(body)
+          PY
+
       - name: Publish release
         uses: softprops/action-gh-release@v3.0.3
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
