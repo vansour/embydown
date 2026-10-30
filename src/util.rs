@@ -74,6 +74,33 @@ pub fn format_ticks(ticks: i64) -> String {
     }
 }
 
+/// Unix 时间戳 → `YYYY-MM-DD HH:MM:SS`（UTC，无第三方依赖）。
+pub fn format_unix_time(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant 的 `civil_from_days`：Unix 天数 → 公历日期。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// 清洗路径中的单个组件：去掉非法字符与控制字符。
 pub fn sanitize_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -148,6 +175,13 @@ mod tests {
         assert_eq!(parse_rate("0"), None);
         assert_eq!(parse_rate("NaN"), None);
         assert_eq!(parse_rate("inf"), None);
+    }
+
+    #[test]
+    fn unix_time_formats_as_utc() {
+        assert_eq!(format_unix_time(0), "1970-01-01 00:00:00");
+        assert_eq!(format_unix_time(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(format_unix_time(1_700_000_001), "2023-11-14 22:13:21");
     }
 
     #[test]

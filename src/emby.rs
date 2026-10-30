@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, RETRY_AFTER};
 use reqwest::Url;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::model::{AuthRequest, AuthResult, Item, MediaStream, QueryResult, User};
@@ -19,6 +20,17 @@ pub struct Client {
     pub token: String,
     pub user_id: String,
     pub device_id: String,
+    /// 是否跳过 TLS 证书校验（重建后台进程的 Client 时需要）
+    pub insecure: bool,
+}
+
+/// 可序列化的连接参数：TUI 把下载任务交给后台守护进程时只传这些。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientCreds {
+    pub server: String,
+    pub token: String,
+    pub user_id: String,
+    pub insecure: bool,
 }
 
 impl Client {
@@ -40,7 +52,25 @@ impl Client {
             token: String::new(),
             user_id: String::new(),
             device_id: format!("{}-cli", CLIENT_NAME),
+            insecure,
         })
+    }
+
+    /// 供后台守护进程跨进程/重启恢复连接。
+    pub fn creds(&self) -> ClientCreds {
+        ClientCreds {
+            server: self.server.clone(),
+            token: self.token.clone(),
+            user_id: self.user_id.clone(),
+            insecure: self.insecure,
+        }
+    }
+
+    pub fn from_creds(creds: &ClientCreds) -> Result<Self> {
+        let mut client = Self::new(&creds.server, creds.insecure)?;
+        client.token = creds.token.clone();
+        client.user_id = creds.user_id.clone();
+        Ok(client)
     }
 
     fn auth_header(&self) -> String {

@@ -41,7 +41,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             out: "./downloads".into(),
-            connections: 8,
+            connections: 2,
             jobs: 2,
             limit: String::new(),
             subs: true,
@@ -141,6 +141,14 @@ pub fn path() -> Result<PathBuf> {
     Ok(base.join("embydown").join("config.json"))
 }
 
+/// 配置/下载记录所在目录。
+pub fn dir() -> Result<PathBuf> {
+    Ok(path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".")))
+}
+
 /// 读取配置；文件不存在时返回 `None`（供 login 首次使用）。
 pub fn load_optional() -> Result<Option<Config>> {
     let path = path()?;
@@ -201,13 +209,20 @@ pub fn edit<T>(f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
 }
 
 fn write_atomic(path: &Path, cfg: &Config) -> Result<()> {
+    let mut text = serde_json::to_vec_pretty(cfg)?;
+    text.push(b'\n');
+    write_atomic_bytes(path, &text)
+}
+
+/// 以 0600 权限原子写文件：临时文件 + fsync + rename。
+///
+/// 原地 truncate 时断电/磁盘满会留下空或半截文件，之后所有命令
+/// （包括 login）都会“解析配置失败”。队列与历史记录也复用这里。
+pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
-            .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
+            .with_context(|| format!("创建目录失败: {}", dir.display()))?;
     }
-    let text = serde_json::to_string_pretty(cfg)?;
-    // 写临时文件 + fsync + rename：原地 truncate 时断电/磁盘满会留下
-    // 空或半截 JSON，之后所有命令（包括 login）都会“解析配置失败”。
     let tmp = tmp_path(path);
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
@@ -216,14 +231,13 @@ fn write_atomic(path: &Path, cfg: &Config) -> Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)
-            .with_context(|| format!("写入配置失败: {}", tmp.display()))?;
-        file.write_all(text.as_bytes())?;
-        file.write_all(b"\n")?;
+            .with_context(|| format!("写入文件失败: {}", tmp.display()))?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         // 已存在的文件可能权限更宽，统一收紧到 0600
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
         std::fs::rename(&tmp, path)
-            .with_context(|| format!("保存配置失败: {}", path.display()))?;
+            .with_context(|| format!("保存文件失败: {}", path.display()))?;
         // 让 rename 本身也落盘（目录项）。
         if let Some(dir) = path.parent()
             && let Ok(d) = std::fs::File::open(dir)
@@ -375,7 +389,8 @@ mod tests {
         // 旧配置文件（只有 servers）读出来时，设置回落到默认值。
         let legacy: Config = serde_json::from_str(r#"{"servers":{}}"#).unwrap();
         assert_eq!(legacy.settings.out, "./downloads");
-        assert_eq!(legacy.settings.connections, 8);
+        assert_eq!(legacy.settings.connections, 2);
+        assert_eq!(legacy.settings.jobs, 2);
         assert!(legacy.settings.resume);
     }
 

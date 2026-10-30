@@ -61,6 +61,17 @@ pub enum Cmd {
     #[command(alias = "tui")]
     Ui,
 
+    /// 运行后台下载服务（TUI 会自动启动；一般无需手动执行）
+    Daemon,
+
+    /// 查看永久保存的下载记录（最新在前）
+    #[command(alias = "records")]
+    History {
+        /// 显示条数；0 表示全部
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
     /// 登录并保存服务器与凭证（可重复执行以添加多个服务器）
     Login(LoginArgs),
 

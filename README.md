@@ -85,7 +85,8 @@ embydown ui       # 等价写法
 `logout` 只清除登录信息，不会重置这些下载设置。
 
 命令行 `embydown dl` 也把这些设置作为默认值（输出目录、连接数、并发、限速、字幕、覆盖、续传、命名模板），
-命令行显式传参时以命令行为准。需要临时反着覆盖时可用 `--no-overwrite`、`--no-resume`、`--no-subs`、
+命令行显式传参时以命令行为准。默认每文件 2 个连接、同时下载 2 个文件（`-c 2 -j 2`）。
+需要临时反着覆盖时可用 `--no-overwrite`、`--no-resume`、`--no-subs`、
 `--no-limit-rate`；`--pattern ""` 表示本次使用内置默认命名模板。
 
 下载确认页会先解析条目：
@@ -98,11 +99,39 @@ embydown ui       # 等价写法
 每个服务器有独立的队列、并发数和限速器，多个服务器会同时下载、互不阻塞；
 同一服务器内的任务按加入顺序排队，并发数由「每服务器并发数」控制。
 
-下载页按键：`↑↓` 选择服务器，`x` 取消该服务器的队列，`X` 取消全部，`c` 清空最近完成记录。
+下载实际由独立的**后台下载服务**执行，所以关掉 TUI、`Ctrl+C`、甚至直接关闭终端都不会中断下载：
+
+```bash
+embydown          # 重新打开即可看到仍在进行的下载
+embydown history  # 查看历史记录（包括 TUI 关闭期间完成的）
+```
+
+下载页按键：`↑↓` 选择服务器，`x` 取消该服务器的队列，`X` 取消全部，`c` 清空最近完成记录（同时删除历史文件）。
 取消或退出时已完成的分块会保留，重新加入同一任务即可续传。
 
 按键：`1-5` / `Tab` 切页，`↑↓` 选择，`Enter` 确认，`Esc` 返回，`?` 查看全部快捷键，`Ctrl+C` 随时退出。
 搜索输入框内普通按键会输入文字，因此切页请用 `Tab`。
+
+## 后台下载服务与记录
+
+TUI 会自动拉起后台服务（`embydown daemon`），它与 TUI 是独立进程、独立进程组：
+TUI 崩溃或关闭终端时，服务会忽略挂断信号继续下载；下次打开 TUI 会重新连接并显示进度。
+
+- 单实例：通过 `$XDG_RUNTIME_DIR/embydown/daemon.sock` 通信，`daemon.lock` 记录 PID，避免两个服务同时下载同一批文件
+- `queue.json`：当前排队/运行中的任务（含服务器凭证与直链），服务重启时会把运行中的任务放回队首，配合 `.part` 续传
+- `history.jsonl`：每次任务结束追加一行，只增不改；任务失败也会记录，包含失败原因
+- `daemon.log`：后台服务的输出与错误，启动失败时先看这里
+
+队列、记录与日志都在 `~/.config/embydown/`（`$XDG_CONFIG_HOME` 可覆盖），权限 `0600`。
+查看记录（时间统一为 UTC）：
+
+```bash
+embydown history            # 最近 50 条
+embydown history --limit 0  # 全部
+```
+
+需要在前台观察后台服务时可直接运行 `embydown daemon`（已有实例时会提示并退出）；
+停止服务：`kill "$(cat "${XDG_RUNTIME_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}/embydown/daemon.lock")"`。
 
 ## 常用命令
 
@@ -154,6 +183,10 @@ embydown dl <ITEM_ID> --limit-rate 5M -c 8 -j 2
 
 # 直接给一个 http(s) 直链也能下（复用同一套分块/续传）
 embydown dl "http://host:8096/Videos/<ID>/stream?static=true&api_key=<KEY>" -o ./downloads
+
+# 后台服务的下载记录（最新在前；--limit 0 显示全部）
+embydown history
+embydown history --limit 200
 ```
 
 ## 已在真实服务器验证
@@ -179,11 +212,13 @@ embydown dl "http://host:8096/Videos/<ID>/stream?static=true&api_key=<KEY>" -o .
 | 3 | `/Items/{id}/Download` | 官方下载接口，需要账号有「允许下载」权限 |
 | 4 | `/Items/{id}/File` | 兜底，部分版本/管理员可用 |
 
-探测用 `Range: bytes=0-0`：返回 `206` 说明支持分段，于是按 `--connections` 并发拉块；返回 `200` 说明不支持，自动退化成单连接流式下载。
+探测用 `Range: bytes=0-0`：返回 `206` 说明支持分段，于是并发拉块；返回 `200` 说明不支持，自动退化成单连接流式下载。
+
+分块大小只由文件大小决定（默认切成约 8 块，单块上限 512 MiB），与 `-c` 并发数无关：为避开限流临时调低 `-c` 不会让已有进度作废。`-c` 只控制每个文件同时发几个 Range 请求。
 
 ## 断点续传
 
-- 分块模式：每完成一块就写入 `<文件名>.part.json`（记录总大小、块大小、已完成块号）。中断后**重跑同一条命令**即可续传。
+- 分块模式：每完成一块就写入 `<文件名>.part.json`（记录总大小、块大小、已完成块号）。中断后**重跑同一条命令**即可续传；升级前用其它 `-c` 下载的 `.part.json` 也会按原来的块布局复用。
 - 单连接模式：`-c 1` 时从 `.part` 已有长度用 `Range: bytes=N-` 续写。
 - 想重新下：加 `--overwrite` 或删掉 `.part` / `.part.json`。
 - 关闭续传：`--no-resume`。
@@ -227,15 +262,15 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 
 ## 发布
 
-版本号在 `Cargo.toml`；推送 `v*` 标签会触发 `.github/workflows/release.yml`：
+版本号在 `Cargo.toml`，变更记录见 [CHANGELOG.md](CHANGELOG.md)；推送 `v*` 标签会触发 `.github/workflows/release.yml`：
 
-- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.1` 对应版本 `0.0.1`）
-- 构建 x86_64 release，打包二进制、README 和 install.sh，生成 SHA-256
+- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.3` 对应版本 `0.0.3`）
+- 构建 x86_64 release，打包二进制、README、CHANGELOG 和 install.sh，生成 SHA-256
 - 创建 GitHub Release 并上传产物
 
 ```bash
-git tag v0.0.1
-git push origin v0.0.1
+git tag v0.0.3
+git push origin v0.0.3
 ```
 
 `main` 分支的 push / PR 会运行 `.github/workflows/ci.yml`（clippy、测试、release 构建）。
@@ -248,9 +283,11 @@ git push origin v0.0.1
 | `HTTP 403` | 账号没有该媒体的播放/下载权限；用管理员账号或在 Emby 里给该用户开权限 |
 | `HTTP 404` | 条目 ID 不对，或直链路径不被该版本支持（工具会自动试下一个候选） |
 | `HTTP 416` | 文件被服务端替换，删掉 `.part` 与 `.part.json` 重下 |
+| `HTTP 429` / Cloudflare `error code: 1015` | 服务器或 CDN 限流。短时间（≤5 分钟）会自动按 `Retry-After` 等待重试；更长的限流会中止本次任务并提示解除时间，`.part` 会保留，到点重跑同一命令即可续传 |
 | `HTTP 404 page not found` | 地址漏了 `https://`，被 301 后登录 POST 降级成 GET。补全 scheme |
 | 直链 302 | 部分服务器把直链跳到 `/play/video/{id}` CDN；reqwest 自动跟随且保留 `Range`，无需处理 |
 | 卡在探测阶段 | 服务器前面有反代且未透传 `Range` 头；用 `-c 1` 走单连接 |
+| TUI 提示「后台下载服务连接失败」 | 看 `~/.config/embydown/daemon.log`；socket 默认在 `$XDG_RUNTIME_DIR/embydown/`，路径过长时设置较短的 `XDG_RUNTIME_DIR`；也可前台运行 `embydown daemon` 复现 |
 | 速度上不去 | 服务器出口/磁盘瓶颈；`-c` 调到 4–16 之间试；`-j` 控制文件级并发 |
 | 自签证书报错 | 加 `--insecure` |
 
@@ -268,7 +305,10 @@ src/naming.rs    命名模板
 src/table.rs     预览表格渲染（按中文双列宽对齐）
 src/tui.rs       交互界面（ratatui）
 src/manager.rs   后台下载队列（每服务器一条下载流）
+src/daemon.rs    后台下载服务（Unix socket 协议、单实例、自动拉起）
+src/store.rs     队列与下载记录持久化（queue.json / history.jsonl）
 src/model.rs     API 数据模型
 install.sh       一键安装脚本
+CHANGELOG.md     版本变更记录
 .github/workflows/  CI 与 tag 发布
 ```

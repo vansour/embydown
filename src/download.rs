@@ -10,7 +10,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,31 @@ use crate::util::{format_bytes, sanitize_component, vlog};
 
 /// 小于这个大小就不分块了（分块开销不值）。
 const MIN_CHUNK: u64 = 4 * 1024 * 1024;
+/// 单个分块上限：超大文件不按比例切成巨型块，否则一块失败要重下很久。
+const MAX_CHUNK: u64 = 512 * 1024 * 1024;
 const MAX_RETRY: u32 = 3;
+
+/// 分块数量与并发数解耦：默认把文件切成约 8 块。
+///
+/// 以前的块大小按 `connections * 4` 计算，用户为了避开服务器限流把
+/// `-c` 调小后，已有的 `.part.json` 会因块布局不同而作废，几 GB 的
+/// 进度被静默丢弃。现在布局只由文件大小决定，`-c` 只控制并发；
+/// 块数也刻意保持较少，减少触发 429 的请求量。
+const DEFAULT_TARGET_CHUNKS: u64 = 8;
+
+/// 默认块大小：只由文件大小决定，与 `-c` 无关。
+fn default_chunk_size(total: u64) -> u64 {
+    total.div_ceil(DEFAULT_TARGET_CHUNKS).clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
+/// 429 自动等待上限。超过这个时长就中止本次任务，避免进程挂起一小时。
+const MAX_AUTO_RATE_WAIT: Duration = Duration::from_secs(300);
+
+/// 限流响应没带 Retry-After 时的默认等待。
+const DEFAULT_RATE_WAIT: Duration = Duration::from_secs(30);
+
+/// 连续遇到限流时最多重试几次（每次都会按 Retry-After 等待）。
+const MAX_RATE_RETRIES: u32 = 5;
 
 /// 把 reqwest 错误转成脱敏后的 anyhow 错误。
 ///
@@ -35,6 +59,161 @@ const MAX_RETRY: u32 = 3;
 /// 错误链后 `{e:#}` 会把 token 打到终端和 CI 日志里。
 fn net_error(context: &str, e: reqwest::Error) -> anyhow::Error {
     anyhow!("{}: {}", context, emby::redact_text(&e.to_string()))
+}
+
+// ───────────────────────── 限流（HTTP 429） ─────────────────────────
+
+/// 服务器返回 429 时抛出的错误，携带 `Retry-After` 解析出的等待时长。
+#[derive(Debug)]
+struct RateLimited {
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(d) if !d.is_zero() => write!(
+                f,
+                "服务器限流（HTTP 429），预计 {} 后解除；已下载的分块已保留，稍后重跑可续传",
+                format_wait(d)
+            ),
+            _ => write!(
+                f,
+                "服务器限流（HTTP 429）；已下载的分块已保留，稍后重跑可续传"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+fn format_wait(d: Duration) -> String {
+    let secs = d.as_secs().max(1);
+    if secs >= 3600 {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
+
+/// 解析 `Retry-After`（秒数形式）。HTTP-date 形式少见，解析不了就按默认值退避。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    raw.parse::<u64>()
+        .ok()
+        .map(|s| Duration::from_secs(s.min(24 * 60 * 60)))
+}
+
+/// 每个主机一份限流状态：一个服务器被限流时不应阻塞另一个服务器。
+static RATE_LIMITS: OnceLock<std::sync::Mutex<HashMap<String, Arc<RateLimitState>>>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct RateLimitState {
+    /// 在此时刻之前不再发送请求。
+    until: std::sync::Mutex<Option<Instant>>,
+    /// 暂停时间过长时置位：窗口内直接失败，而不是挂起等待。
+    fatal: AtomicBool,
+}
+
+/// 获取某个 URL 所属主机的限流状态。
+fn rate_limit_for(url: &str) -> Arc<RateLimitState> {
+    let key = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| url.to_string());
+    let map = RATE_LIMITS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(RateLimitState::default()))
+        .clone()
+}
+
+impl RateLimitState {
+    fn remaining(&self) -> Duration {
+        let g = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        g.and_then(|t| t.checked_duration_since(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    /// 记录一次 429；返回 true 表示暂停窗口被延长（调用方据此只提示一次）。
+    fn note(&self, wait: Duration) -> bool {
+        let wait = wait.max(Duration::from_secs(1));
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            self.fatal
+                .store(wait > MAX_AUTO_RATE_WAIT, Ordering::SeqCst);
+        } else if wait > MAX_AUTO_RATE_WAIT {
+            self.fatal.store(true, Ordering::SeqCst);
+        }
+        let until = Instant::now() + wait;
+        let mut g = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        let extended = g.is_none_or(|t| t < until);
+        if extended {
+            *g = Some(until);
+        }
+        extended
+    }
+
+    /// 当前是否处于“等待太久、直接失败”的限流窗口。
+    fn is_blocking(&self) -> bool {
+        self.fatal.load(Ordering::SeqCst) && !self.remaining().is_zero()
+    }
+
+    /// 发送请求前调用：短限流在这里睡眠等待，长限流立即返回 `Limited`。
+    async fn enter(&self, cancel: &AtomicBool) -> Gate {
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Gate::Cancelled;
+            }
+            let remain = self.remaining();
+            if remain.is_zero() {
+                return Gate::Ready;
+            }
+            if self.fatal.load(Ordering::SeqCst) {
+                return Gate::Limited;
+            }
+            let step = remain.min(Duration::from_millis(500));
+            tokio::select! {
+                biased;
+                _ = wait_cancelled(cancel) => return Gate::Cancelled,
+                _ = tokio::time::sleep(step) => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Ready,
+    Cancelled,
+    Limited,
+}
+
+fn rate_notice(pb: &ProgressBar, wait: Duration, blocking: bool) {
+    if blocking {
+        pb.println(format!(
+            "⏳ 服务器限流（HTTP 429），需等待约 {}；本次任务先中止（.part 已保留，稍后重跑可续传）",
+            format_wait(wait)
+        ));
+    } else {
+        pb.println(format!(
+            "⏳ 服务器限流（HTTP 429），暂停 {} 后自动重试…",
+            format_wait(wait)
+        ));
+    }
+}
+
+/// 对外暴露给下载队列：该服务器是否仍在限流窗口内、以及还要等多久。
+pub fn server_rate_limited(server: &str) -> Option<Duration> {
+    let gate = rate_limit_for(server);
+    if gate.is_blocking() {
+        Some(gate.remaining())
+    } else {
+        None
+    }
 }
 
 /// 轮询取消标记。配合 `tokio::select!` 让挂起的网络调用也能被中断，
@@ -93,7 +272,7 @@ async fn lock_dest_cancellable(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadOpts {
     pub out: PathBuf,
     pub pattern: Option<String>,
@@ -111,7 +290,7 @@ impl Default for DownloadOpts {
         Self {
             out: PathBuf::from("./downloads"),
             pattern: None,
-            connections: 8,
+            connections: 2,
             jobs: 2,
             limit_rate: None,
             resume: true,
@@ -297,7 +476,54 @@ pub async fn probe(http: &reqwest::Client, url: &str) -> Result<Probe> {
         403 => bail!("HTTP 403 被拒绝：该账号可能未开启「允许下载」/「允许播放」权限"),
         404 => bail!("HTTP 404：条目不存在，或该类型的直链路径不可用"),
         416 => bail!("HTTP 416：Range 越界（文件可能已被替换，删掉 .part 重试）"),
+        429 => Err(RateLimited {
+            retry_after: parse_retry_after(resp.headers()),
+        }
+        .into()),
         other => bail!("HTTP {other}：直链不可用"),
+    }
+}
+
+/// 探测直链，遇到限流时按 `Retry-After` 自动等待后重试。
+///
+/// 注意：限流是服务器级别的，换候选直链没有意义——调用方看到
+/// `RateLimited` 后应直接结束该条目，不要继续尝试其它 URL。
+async fn probe_with_retry(
+    http: &reqwest::Client,
+    url: &str,
+    pb: &ProgressBar,
+    cancel: &AtomicBool,
+) -> Result<Probe> {
+    let gate = rate_limit_for(url);
+    let mut attempts = 0u32;
+    loop {
+        match gate.enter(cancel).await {
+            Gate::Cancelled => return Err(anyhow::Error::new(Cancelled)),
+            Gate::Limited => {
+                return Err(RateLimited {
+                    retry_after: Some(gate.remaining()),
+                }
+                .into());
+            }
+            Gate::Ready => {}
+        }
+        match probe(http, url).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                let Some(rl) = e.downcast_ref::<RateLimited>() else {
+                    return Err(e);
+                };
+                let wait = rl.retry_after.unwrap_or(DEFAULT_RATE_WAIT);
+                if gate.note(wait) {
+                    rate_notice(pb, wait, gate.is_blocking());
+                }
+                attempts += 1;
+                if attempts >= MAX_RATE_RETRIES {
+                    return Err(e);
+                }
+                // 下一轮由 gate.enter() 负责等待（短限流）或立即失败（长限流）。
+            }
+        }
     }
 }
 
@@ -324,12 +550,7 @@ async fn download_file(
     let mut used_url = String::new();
     let mut last_err: Option<anyhow::Error> = None;
     for url in candidates {
-        let probed = tokio::select! {
-            biased;
-            _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
-            r = probe(http, url) => r,
-        };
-        match probed {
+        match probe_with_retry(http, url, pb, cancel.as_ref()).await {
             Ok(p) => {
                 vlog(2, format!("  ↳ 直链可用: {}", emby::redact(url)));
                 used_url = url.clone();
@@ -345,6 +566,10 @@ async fn download_file(
                         emby::redact_text(&e.to_string())
                     ),
                 );
+                // 限流是服务器级别的：换下一个候选 URL 只会继续消耗配额。
+                if e.downcast_ref::<RateLimited>().is_some() {
+                    return Err(e);
+                }
                 last_err = Some(e);
             }
         }
@@ -444,9 +669,11 @@ async fn download_chunked(
     limiter: &Arc<Limiter>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<u64> {
-    let target_chunks = (opts.connections as u64 * 4).max(4);
-    let chunk_size = total.div_ceil(target_chunks).max(MIN_CHUNK);
-    let count = total.div_ceil(chunk_size);
+    // 块布局只由文件大小决定，与 `-c` 无关：调低并发不会让已有续传状态作废。
+    // 如果旧状态里记录了别的块大小（老版本按 `-c` 计算），仍然优先复用它，
+    // 这样升级后也能保住之前下载的进度。
+    let mut chunk_size = default_chunk_size(total);
+    let mut count = total.div_ceil(chunk_size);
 
     // 取消发生在任何块开始之前：此时 .part 还是零填充的预分配文件，
     // 绝不能继续走下去，否则长度校验会“通过”并把空文件 rename 成正式文件。
@@ -457,7 +684,7 @@ async fn download_chunked(
     // 续传：状态文件、part 长度、块布局都对得上才复用。
     //
     // 只信任 .part.json 是不安全的：例如 `-c 1` 重试会 File::create 截断
-    // .part，但旧状态文件仍在；下一次 `-c 8` 会跳过“已完成”块，
+    // .part，但旧状态文件仍在；下一次分块下载会跳过“已完成”块，
     // set_len 把缺口补成零，长度校验却天然通过。
     let part_len = tokio::fs::metadata(part).await.map(|m| m.len()).ok();
     let mut completed: HashSet<u32> = HashSet::new();
@@ -469,13 +696,17 @@ async fn download_chunked(
         && let Ok(st) = serde_json::from_str::<PartState>(&text)
         && st.version == STATE_VERSION
         && st.total == total
-        && st.chunk_size == chunk_size
+        && st.chunk_size > 0
+        && st.chunk_size <= total
     {
+        let stored_count = total.div_ceil(st.chunk_size);
         completed = st
             .completed
             .into_iter()
-            .filter(|i| *i < count as u32)
+            .filter(|i| (*i as u64) < stored_count)
             .collect();
+        chunk_size = st.chunk_size;
+        count = stored_count;
         resuming = true;
         vlog(
             1,
@@ -488,6 +719,12 @@ async fn download_chunked(
         );
     }
     if !resuming {
+        if opts.resume && !opts.overwrite && part_len.is_some() {
+            vlog(
+                1,
+                "  ↳ .part 状态与当前文件不匹配，将重新下载（旧 .part 会被截断）",
+            );
+        }
         // 重新开始时清掉旧状态，避免中途中断后旧状态被误用。
         tokio::fs::remove_file(state_file).await.ok();
     }
@@ -508,7 +745,7 @@ async fn download_chunked(
     let done = Arc::new(Mutex::new(completed));
     let sem = Arc::new(Semaphore::new(opts.connections.max(1)));
     let mut set = tokio::task::JoinSet::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<anyhow::Error> = Vec::new();
     let mut cancelled = false;
 
     for idx in 0..count {
@@ -564,10 +801,10 @@ async fn download_chunked(
                 if e.downcast_ref::<Cancelled>().is_some() {
                     cancelled = true;
                 } else {
-                    errors.push(e.to_string());
+                    errors.push(e);
                 }
             }
-            Err(e) => errors.push(format!("任务崩溃: {e}")),
+            Err(e) => errors.push(anyhow!("任务崩溃: {e}")),
         }
     }
 
@@ -582,10 +819,23 @@ async fn download_chunked(
         return Err(anyhow::Error::new(Cancelled));
     }
     if !errors.is_empty() {
+        // 多个分块同时撞上限流时只报一条，避免刷屏；任务层再统一提示等待时间。
+        if let Some(rl) = errors.iter().find_map(|e| e.downcast_ref::<RateLimited>()) {
+            bail!(
+                "{}（共 {} 个分块受影响；.part 与状态已保留，可直接重试续传）",
+                rl,
+                errors.len()
+            );
+        }
+        let joined = errors
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
         bail!(
             "{} 个分块下载失败（.part 与状态已保留，可直接重试续传）：{}",
             errors.len(),
-            errors.join(" | ")
+            joined
         );
     }
     bail!(
@@ -641,16 +891,37 @@ async fn fetch_chunk(
     limiter: &Limiter,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let gate = rate_limit_for(url);
     let mut last: Option<anyhow::Error> = None;
     for attempt in 0..MAX_RETRY {
         if cancel.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Cancelled));
+        }
+        match gate.enter(cancel).await {
+            Gate::Cancelled => return Err(anyhow::Error::new(Cancelled)),
+            Gate::Limited => {
+                return Err(RateLimited {
+                    retry_after: Some(gate.remaining()),
+                }
+                .into());
+            }
+            Gate::Ready => {}
         }
         match fetch_chunk_once(http, url, start, end, part, pb, limiter, cancel).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if e.downcast_ref::<Cancelled>().is_some() {
                     return Err(e);
+                }
+                if let Some(rl) = e.downcast_ref::<RateLimited>() {
+                    let wait = rl.retry_after.unwrap_or(DEFAULT_RATE_WAIT);
+                    if gate.note(wait) {
+                        rate_notice(pb, wait, gate.is_blocking());
+                    }
+                    // 不在这里各自 sleep：下一轮 gate.enter() 统一等待，
+                    // 避免几十个分块同时醒来继续冲击限流窗口。
+                    last = Some(e);
+                    continue;
                 }
                 vlog(
                     1,
@@ -689,6 +960,12 @@ async fn fetch_chunk_once(
         _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
         r = req.send() => r.map_err(|e| net_error("建立下载连接失败", e))?,
     };
+    if resp.status().as_u16() == 429 {
+        return Err(RateLimited {
+            retry_after: parse_retry_after(resp.headers()),
+        }
+        .into());
+    }
     if resp.status().as_u16() != 206 {
         bail!("期望 206，实际 HTTP {}", resp.status().as_u16());
     }
@@ -785,14 +1062,43 @@ async fn download_single(
         && total.map(|t| existing < t).unwrap_or(false);
     let start = if can_resume { existing } else { 0 };
 
-    let mut req = http.get(url);
-    if start > 0 {
-        req = req.header(RANGE, format!("bytes={start}-"));
-    }
-    let resp = tokio::select! {
-        biased;
-        _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
-        r = req.send() => r.map_err(|e| net_error("建立下载连接失败", e))?,
+    let gate = rate_limit_for(url);
+    let mut rate_retries = 0u32;
+    let resp = loop {
+        match gate.enter(cancel).await {
+            Gate::Cancelled => return Err(anyhow::Error::new(Cancelled)),
+            Gate::Limited => {
+                return Err(RateLimited {
+                    retry_after: Some(gate.remaining()),
+                }
+                .into());
+            }
+            Gate::Ready => {}
+        }
+        let mut req = http.get(url);
+        if start > 0 {
+            req = req.header(RANGE, format!("bytes={start}-"));
+        }
+        let resp = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
+            r = req.send() => r.map_err(|e| net_error("建立下载连接失败", e))?,
+        };
+        if resp.status().as_u16() == 429 {
+            let wait = parse_retry_after(resp.headers()).unwrap_or(DEFAULT_RATE_WAIT);
+            if gate.note(wait) {
+                rate_notice(pb, wait, gate.is_blocking());
+            }
+            rate_retries += 1;
+            if rate_retries >= MAX_RATE_RETRIES {
+                return Err(RateLimited {
+                    retry_after: Some(gate.remaining()),
+                }
+                .into());
+            }
+            continue;
+        }
+        break resp;
     };
     let code = resp.status().as_u16();
     if start > 0 && code != 206 {
@@ -1075,6 +1381,14 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        if let Some(wait) = server_rate_limited(&client.server) {
+            eprintln!(
+                "⏳ {} 服务器仍在限流，约 {} 后解除，停止派发剩余条目；稍后重跑同一命令可续传",
+                client.server,
+                format_wait(wait)
+            );
+            break;
+        }
         if fail_streak.load(Ordering::SeqCst) >= 3 {
             eprintln!("⚠️  连续 3 个条目失败，停止派发（先用 --verbose 看具体错误）");
             break;
@@ -1327,6 +1641,67 @@ fn shorten(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_layout_is_independent_of_connections() {
+        // 700 MiB 左右的文件切成约 8 块；块大小只由 total 决定。
+        let total = 748_007_902u64;
+        let chunk = default_chunk_size(total);
+        assert_eq!(chunk, 93_500_988);
+        assert_eq!(total.div_ceil(chunk), 8);
+
+        // 超大文件的块大小封顶，避免一块失败要重下几十 GB。
+        assert_eq!(default_chunk_size(100 * 1024 * 1024 * 1024), MAX_CHUNK);
+        // 小文件至少一块，且不会因为 clamp 产生 0 块。
+        let small = default_chunk_size(1024);
+        assert_eq!(1024u64.div_ceil(small), 1);
+    }
+
+    #[test]
+    fn retry_after_header_is_parsed() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("3211"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(3211)));
+
+        h.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("0"));
+        assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
+
+        // HTTP-date 形式暂不支持，应按“无 Retry-After”处理。
+        h.insert(
+            RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&h), None);
+
+        h.remove(RETRY_AFTER);
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn format_wait_uses_readable_units() {
+        assert_eq!(format_wait(Duration::from_secs(0)), "1 秒");
+        assert_eq!(format_wait(Duration::from_secs(5)), "5 秒");
+        assert_eq!(format_wait(Duration::from_secs(65)), "1 分 5 秒");
+        assert_eq!(format_wait(Duration::from_secs(3720)), "1 小时 2 分");
+    }
+
+    #[test]
+    fn short_limit_waits_and_long_limit_fails_fast() {
+        let gate = RateLimitState::default();
+        assert_eq!(gate.remaining(), Duration::ZERO);
+        assert!(!gate.is_blocking());
+
+        assert!(gate.note(Duration::from_secs(10)));
+        assert!(!gate.is_blocking());
+
+        // 长窗口把状态升级为“窗口内直接失败”，并延长暂停时间。
+        assert!(gate.note(Duration::from_secs(400)));
+        assert!(gate.is_blocking());
+
+        // 窗口内的较短记录不会重复提示，也不会降低等待时间。
+        assert!(!gate.note(Duration::from_secs(10)));
+        assert!(gate.is_blocking());
+    }
 
     #[test]
     fn chunk_ranges_cover_the_file_exactly() {

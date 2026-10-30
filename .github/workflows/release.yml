@@ -43,7 +43,7 @@ jobs:
           asset="embydown-${GITHUB_REF_NAME}-${target}"
           mkdir -p "dist/${asset}"
           cp target/release/embydown "dist/${asset}/"
-          cp README.md install.sh "dist/${asset}/"
+          cp README.md CHANGELOG.md install.sh "dist/${asset}/"
           tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
           ( cd dist && sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256" )
 

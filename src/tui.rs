@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -21,8 +22,9 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config, Profile, Settings};
+use crate::daemon::DaemonHandle;
 use crate::download::DownloadOpts;
-use crate::manager::{FinishedStatus, Manager};
+use crate::manager::FinishedStatus;
 use crate::emby::Client;
 use crate::model::Item;
 use crate::util::{format_bytes, parse_rate};
@@ -326,7 +328,8 @@ struct App {
     settings_state: ListState,
     detail: Option<Detail>,
     modal: Modal,
-    manager: Manager,
+    /// 下载由独立的后台守护进程执行；这里只保留与它通信的句柄。
+    daemon: DaemonHandle,
     downloads: ListState,
     download_focus: Option<String>,
     seq: u64,
@@ -365,7 +368,7 @@ impl App {
             settings_state: ListState::default().with_selected(Some(0)),
             detail: None,
             modal: Modal::None,
-            manager: Manager::new(),
+            daemon: DaemonHandle::new(),
             downloads: ListState::default().with_selected(Some(0)),
             download_focus: None,
             seq: 0,
@@ -389,6 +392,10 @@ impl App {
 
     fn tick(&mut self) {
         self.spin = self.spin.wrapping_add(1);
+        // 后台服务连接失败时把原因带到状态栏，避免下载页一直空白。
+        if let Some(err) = self.daemon.take_error() {
+            self.set_error(err);
+        }
     }
 
     fn set_info(&mut self, text: impl Into<String>) {
@@ -742,28 +749,28 @@ impl App {
     }
 
     fn on_downloads_key(&mut self, key: KeyEvent) -> Result<()> {
-        let count = self.manager.state().servers.len();
+        let count = self.daemon.state().servers.len();
         match key.code {
             KeyCode::Up => move_sel(&mut self.downloads, count, -1),
             KeyCode::Down => move_sel(&mut self.downloads, count, 1),
             KeyCode::Char('x') => {
                 let name = {
-                    let st = self.manager.state();
+                    let st = self.daemon.state();
                     let idx = self.downloads.selected().unwrap_or(0);
                     st.servers.keys().nth(idx).cloned()
                 };
                 if let Some(name) = name {
-                    self.manager.cancel_server(&name);
+                    self.daemon.cancel_server(&name);
                     self.set_warn(format!("已取消 {name} 的下载队列"));
                 }
             }
             KeyCode::Char('X') => {
-                self.manager.cancel_all();
+                self.daemon.cancel_all();
                 self.set_warn("已取消所有服务器的下载");
             }
             KeyCode::Char('c') => {
-                self.manager.clear_finished();
-                self.set_info("已清空下载历史");
+                self.daemon.clear_finished();
+                self.set_info("已清空下载历史（记录文件也会删除）");
             }
             _ => {}
         }
@@ -1172,7 +1179,7 @@ impl App {
             Ok((client, items, opts, skipped)) => {
                 let count = items.len();
                 let server = d.server.clone();
-                self.manager.enqueue(server.clone(), client, items, opts);
+                self.daemon.enqueue(server.clone(), client, items, opts);
                 self.detail = None;
                 self.modal = Modal::None;
                 self.tab = Tab::Downloads;
@@ -1556,6 +1563,9 @@ impl App {
             self.search.query.render_line("关键字: ", focused, false)
         };
         f.render_widget(Paragraph::new(line), inner);
+        // 删除中文等宽字符时光标块可能只覆盖左半格，右半格会留下方框残影。
+        // 输入行整行强制重画，保证右半格也被空格覆盖。
+        force_redraw(f, inner);
 
         let header = Row::new(vec![
             Cell::from("服务器"),
@@ -1672,7 +1682,7 @@ impl App {
         // 队列刚加入时把选中行切到对应服务器
         if let Some(name) = self.download_focus.clone() {
             let idx = {
-                let st = self.manager.state();
+                let st = self.daemon.state();
                 st.servers.keys().position(|k| k == &name)
             };
             if let Some(idx) = idx {
@@ -1681,12 +1691,12 @@ impl App {
             }
         }
 
-        let server_count = self.manager.state().servers.len();
+        let server_count = self.daemon.state().servers.len();
         let mut total_active = 0usize;
         let mut total_queue = 0usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
         {
-            let st = self.manager.state();
+            let st = self.daemon.state();
             let selected = self.downloads.selected().unwrap_or(0);
             for (idx, (name, ss)) in st.servers.iter().enumerate() {
                 total_active += ss.active.len();
@@ -1716,14 +1726,14 @@ impl App {
                     ),
                 ]));
                 for a in &ss.active {
-                    let pos = a.pb.position();
-                    let len = a.pb.length().unwrap_or(0);
+                    let pos = a.position;
+                    let len = a.length;
                     let frac = if len > 0 {
                         (pos as f64 / len as f64).clamp(0.0, 1.0)
                     } else {
                         0.0
                     };
-                    let speed = pos as f64 / a.started.elapsed().as_secs_f64().max(0.001);
+                    let speed = pos as f64 / a.elapsed_secs.max(0.001);
                     let total = if len > 0 {
                         format!("{}/{}", format_bytes(pos), format_bytes(len))
                     } else {
@@ -1780,7 +1790,7 @@ impl App {
 
         let mut hist: Vec<Line<'static>> = Vec::new();
         {
-            let st = self.manager.state();
+            let st = self.daemon.state();
             for f in st.finished.iter().rev().take(8) {
                 let (mark, color) = match f.status {
                     FinishedStatus::Done => ("✓", Color::Green),
@@ -1797,6 +1807,26 @@ impl App {
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
+                // 失败时补一行原因，尤其是限流解除时间——否则 TUI 里只看到一个红叉。
+                if f.status == FinishedStatus::Failed
+                    && let Some(err) = f.error.as_deref()
+                {
+                    let line = err.lines().next().unwrap_or(err);
+                    let brief = if line.chars().count() > 96 {
+                        format!(
+                            "…{}",
+                            line.chars()
+                                .skip(line.chars().count() - 96)
+                                .collect::<String>()
+                        )
+                    } else {
+                        line.to_string()
+                    };
+                    hist.push(Line::from(vec![
+                        Span::styled("    ↳ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(brief, Style::default().fg(Color::Red)),
+                    ]));
+                }
             }
             if hist.is_empty() {
                 hist.push(Line::from(Span::styled(
@@ -2020,10 +2050,12 @@ impl App {
                     )),
                 ];
                 let block = Block::default().borders(Borders::ALL).title(" 编辑 ");
+                let inner = block.inner(area);
                 f.render_widget(
                     Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
                     area,
                 );
+                force_redraw(f, inner);
             }
             Modal::Login(form) => {
                 let area = centered(72, 65, f.area());
@@ -2076,10 +2108,12 @@ impl App {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .title(" 登录服务器 ");
+                let inner = block.inner(area);
                 f.render_widget(
                     Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
                     area,
                 );
+                force_redraw(f, inner);
             }
             Modal::Seasons(ss) => {
                 let area = centered(55, 72, f.area());
@@ -2297,6 +2331,26 @@ impl App {
 }
 
 // ───────────────────────── 输入框 ─────────────────────────
+
+/// 把矩形内的单元格标记为「下一帧无条件重写」。
+///
+/// 删除中文等宽字符时，旧宽字符的右半格在 ratatui 的 diff 里是与新空白格
+/// 相等的，通常不会发给终端；部分终端（尤其通过 tmux/ConPTY 转发的场景）
+/// 不会自动清掉右半格，于是留下一个方框状残影。整行强制重写后，右半格
+/// 也会收到一个空格，残影随即消失。
+fn force_redraw(f: &mut Frame, area: Rect) {
+    mark_always_update(f.buffer_mut(), area);
+}
+
+fn mark_always_update(buf: &mut Buffer, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
+}
 
 #[derive(Default, Clone)]
 struct TextInput {
@@ -2575,9 +2629,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled("下载队列", accent())),
         key("↑↓", "选择服务器"),
         key("x / X", "取消当前服务器的队列 / 取消全部"),
-        key("c", "清空最近完成记录"),
+        key("c", "清空最近完成记录（并删除历史文件）"),
         Line::from(Span::styled(
-            "  下载在后台排队进行，每个服务器一条独立下载流，不影响继续操作。",
+            "  下载由独立的后台服务执行，关闭界面/终端不会中断，下次打开可继续查看。",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -2651,5 +2705,28 @@ mod tests {
         let shown = format!("{before}{at}{after}");
         assert_eq!(shown, "•••••• ");
         assert!(!shown.contains('s'));
+    }
+
+    #[test]
+    fn force_redraw_covers_wide_char_trailing_cell() {
+        let area = Rect::new(0, 0, 12, 1);
+
+        // 上一帧输入「电影」：宽字符占 0..4 列，光标块在第 4 列。
+        let mut prev = Buffer::empty(area);
+        let line = TextInput::new("电影").render_line("", false, false);
+        prev.set_line(0, 0, &line, area.width);
+
+        // 退格删除「影」后，光标块移到第 2 列；第 3 列是「影」的右半格，
+        // 不强制重写的话终端可能留下方框残影。
+        let mut next = Buffer::empty(area);
+        let line = TextInput::new("电").render_line("", false, false);
+        next.set_line(0, 0, &line, area.width);
+        mark_always_update(&mut next, area);
+
+        let changed: Vec<u16> = prev.diff(&next).iter().map(|(x, _, _)| *x).collect();
+        assert!(changed.contains(&3), "宽字符右半格必须重写: {changed:?}");
+        // 宽字符「电」占两格，diff 会跳过它的右半格（第 1 列），其余整行都重写。
+        assert_eq!(changed.len(), area.width as usize - 1);
+        assert!(!changed.contains(&1));
     }
 }

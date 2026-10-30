@@ -2,6 +2,10 @@
 //!
 //! 每个服务器一条独立的下载流：有自己的队列、并发数和限速器，互不阻塞。
 //! 下载任务在后台运行，进度通过隐藏的 `ProgressBar` 暴露给 TUI。
+//!
+//! 队列与完成记录都会落盘（见 [`crate::store`]）：TUI 以独立进程的方式
+//! 通过 Unix socket 控制本模块，因此 TUI 崩溃/关闭不会中断下载；守护进程
+//! 重启时也会从 `queue.json` 恢复未完成的任务。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,16 +13,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use indicatif::ProgressBar;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::download::{self, DownloadOpts, Limiter};
-use crate::emby::Client;
+use crate::emby::{Client, ClientCreds};
 use crate::model::Item;
+use crate::store::{self, JobRecord, PersistedServer, PersistedState};
 
 #[derive(Default)]
 pub struct ManagerState {
     pub servers: BTreeMap<String, ServerState>,
-    /// 最近完成的下载（最多保留 50 条）
+    /// 最近完成的下载（最多保留 50 条；完整历史在 history.jsonl）
     pub finished: Vec<Finished>,
     seq: u64,
 }
@@ -35,6 +41,8 @@ pub struct ServerState {
     pub subs: usize,
     pub bytes: u64,
     pub stop_requested: bool,
+    /// 重建后台任务用的连接参数（随队列一起落盘）。
+    creds: Option<ClientCreds>,
 }
 
 pub struct PendingJob {
@@ -49,9 +57,11 @@ pub struct ActiveJob {
     pub title: String,
     pub pb: ProgressBar,
     pub started: Instant,
+    item: Item,
+    opts: DownloadOpts,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum FinishedStatus {
     Done,
     Skipped,
@@ -59,13 +69,54 @@ pub enum FinishedStatus {
     Cancelled,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finished {
     pub server: String,
     pub title: String,
     pub status: FinishedStatus,
     pub bytes: u64,
+    /// 失败原因（成功/跳过时为空），TUI 里显示在标题后面。
+    pub error: Option<String>,
 }
 
+// ───────────────────────── 可序列化的界面快照 ─────────────────────────
+
+/// 守护进程每秒推给 TUI 的状态。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub servers: BTreeMap<String, ServerView>,
+    pub finished: Vec<Finished>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServerView {
+    pub queue: Vec<QueueView>,
+    pub active: Vec<ActiveView>,
+    pub max_jobs: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub skipped: usize,
+    pub subs: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct QueueView {
+    pub id: u64,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActiveView {
+    pub id: u64,
+    pub title: String,
+    pub position: u64,
+    pub length: u64,
+    pub elapsed_secs: f64,
+}
+
+#[derive(Clone)]
 pub struct Manager {
     tx: mpsc::UnboundedSender<Cmd>,
     state: Arc<Mutex<ManagerState>>,
@@ -132,6 +183,192 @@ impl Manager {
     pub fn state(&self) -> std::sync::MutexGuard<'_, ManagerState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// 供 TUI 轮询的可序列化快照。
+    pub fn snapshot(&self) -> Snapshot {
+        let st = self.state();
+        snapshot_of(&st)
+    }
+
+    /// 同步落盘当前队列（守护进程退出前调用）。
+    pub fn flush(&self) {
+        let st = self.state();
+        if let Err(e) = store::save_state(&persisted(&st)) {
+            eprintln!("⚠️  保存下载队列失败: {e:#}");
+        }
+    }
+}
+
+fn snapshot_of(st: &ManagerState) -> Snapshot {
+    Snapshot {
+        servers: st
+            .servers
+            .iter()
+            .map(|(name, ss)| {
+                let view = ServerView {
+                    queue: ss
+                        .queue
+                        .iter()
+                        .map(|q| QueueView {
+                            id: q.id,
+                            title: q.title.clone(),
+                        })
+                        .collect(),
+                    active: ss
+                        .active
+                        .iter()
+                        .map(|a| ActiveView {
+                            id: a.id,
+                            title: a.title.clone(),
+                            position: a.pb.position(),
+                            length: a.pb.length().unwrap_or(0),
+                            elapsed_secs: a.started.elapsed().as_secs_f64(),
+                        })
+                        .collect(),
+                    max_jobs: ss.max_jobs,
+                    done: ss.done,
+                    failed: ss.failed,
+                    cancelled: ss.cancelled,
+                    skipped: ss.skipped,
+                    subs: ss.subs,
+                    bytes: ss.bytes,
+                };
+                (name.clone(), view)
+            })
+            .collect(),
+        finished: st.finished.clone(),
+    }
+}
+
+/// 把内存状态转换成可落盘格式。
+fn persisted(st: &ManagerState) -> PersistedState {
+    PersistedState {
+        version: store::STATE_VERSION,
+        seq: st.seq,
+        servers: st
+            .servers
+            .iter()
+            .map(|(name, ss)| {
+                let record = |id: u64, title: &str, item: &Item, opts: &DownloadOpts| JobRecord {
+                    id,
+                    title: title.to_string(),
+                    item: item.clone(),
+                    opts: opts.clone(),
+                };
+                let server = PersistedServer {
+                    creds: ss.creds.clone(),
+                    max_jobs: ss.max_jobs,
+                    queue: ss
+                        .queue
+                        .iter()
+                        .map(|q| record(q.id, &q.title, &q.item, &q.opts))
+                        .collect(),
+                    active: ss
+                        .active
+                        .iter()
+                        .map(|a| record(a.id, &a.title, &a.item, &a.opts))
+                        .collect(),
+                    done: ss.done,
+                    failed: ss.failed,
+                    cancelled: ss.cancelled,
+                    skipped: ss.skipped,
+                    subs: ss.subs,
+                    bytes: ss.bytes,
+                };
+                (name.clone(), server)
+            })
+            .collect(),
+    }
+}
+
+/// 启动时恢复上次的队列与历史。返回是否恢复了旧队列。
+fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCtx>) -> bool {
+    let saved = store::load_state();
+    let had_state = saved.is_some();
+    let saved = saved.unwrap_or_default();
+    let config = crate::config::load_optional().ok().flatten().unwrap_or_default();
+
+    {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.seq = saved.seq;
+        for (name, ps) in saved.servers {
+            let creds = ps.creds.clone().or_else(|| {
+                config.get(&name).map(|p| ClientCreds {
+                    server: p.server.clone(),
+                    token: p.token.clone(),
+                    user_id: p.user_id.clone(),
+                    insecure: p.insecure,
+                })
+            });
+            let mut pending = VecDeque::new();
+            // 崩溃/退出时正在运行的任务优先重新排队；.part 会让它们续传。
+            for job in ps.active.into_iter().rev() {
+                pending.push_front(PendingJob {
+                    id: job.id,
+                    title: job.title,
+                    item: job.item,
+                    opts: job.opts,
+                });
+            }
+            for job in ps.queue {
+                pending.push_back(PendingJob {
+                    id: job.id,
+                    title: job.title,
+                    item: job.item,
+                    opts: job.opts,
+                });
+            }
+            st.servers.insert(
+                name,
+                ServerState {
+                    queue: pending,
+                    active: Vec::new(),
+                    max_jobs: ps.max_jobs.clamp(1, 8),
+                    done: ps.done,
+                    failed: ps.failed,
+                    cancelled: ps.cancelled,
+                    skipped: ps.skipped,
+                    subs: ps.subs,
+                    bytes: ps.bytes,
+                    stop_requested: false,
+                    creds,
+                },
+            );
+        }
+
+        // 历史只保留最近 50 条在内存里；完整记录仍在 history.jsonl。
+        let history = store::load_history();
+        let skip = history.len().saturating_sub(50);
+        st.finished = history
+            .into_iter()
+            .skip(skip)
+            .map(|h| h.entry)
+            .collect();
+    }
+
+    // 后台任务需要用保存的 token 重建客户端，否则重启后无法继续下载。
+    let st = state.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, ss) in &st.servers {
+        let Some(creds) = &ss.creds else { continue };
+        let Ok(client) = Client::from_creds(creds) else {
+            eprintln!("⚠️  无法为 {name} 恢复下载连接，队列将等待下次入队时刷新");
+            continue;
+        };
+        let rate = ss
+            .queue
+            .front()
+            .map(|j| j.opts.limit_rate)
+            .unwrap_or_default();
+        ctx.insert(
+            name.clone(),
+            ServerCtx {
+                client,
+                limiter: Arc::new(Limiter::new(rate)),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+    had_state
 }
 
 async fn run(
@@ -140,8 +377,15 @@ async fn run(
     state: Arc<Mutex<ManagerState>>,
 ) {
     let mut ctx: BTreeMap<String, ServerCtx> = BTreeMap::new();
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
+    let mut dirty = restore(&state, &mut ctx);
+    // 限流窗口到期后即使没有新命令，也要重新派发队列里的任务。
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                let Some(cmd) = maybe else { break };
+                match cmd {
             Cmd::Enqueue(cmd) => {
                 let EnqueueCmd {
                     server,
@@ -160,6 +404,7 @@ async fn run(
                         reset_cancel = true;
                     }
                     entry.max_jobs = opts.jobs.clamp(1, 8);
+                    entry.creds = Some(client.creds());
                     for (offset, item) in items.into_iter().enumerate() {
                         let title = item.title();
                         entry.queue.push_back(PendingJob {
@@ -191,6 +436,7 @@ async fn run(
                         );
                     }
                 }
+                dirty = true;
             }
             Cmd::CancelServer(server) => {
                 if let Some(c) = ctx.get(&server) {
@@ -201,6 +447,8 @@ async fn run(
                     ss.stop_requested = true;
                     ss.queue.clear();
                 }
+                drop(st);
+                dirty = true;
             }
             Cmd::CancelAll => {
                 for c in ctx.values() {
@@ -211,10 +459,17 @@ async fn run(
                     ss.stop_requested = true;
                     ss.queue.clear();
                 }
+                drop(st);
+                dirty = true;
             }
             Cmd::ClearFinished => {
-                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                st.finished.clear();
+                {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.finished.clear();
+                }
+                if let Err(e) = store::clear_history() {
+                    eprintln!("⚠️  清空下载记录失败: {e:#}");
+                }
             }
             Cmd::Completed {
                 server,
@@ -253,32 +508,67 @@ async fn run(
                         title: job.title,
                         status,
                         bytes: result.as_ref().map(|r| r.bytes).unwrap_or(0),
+                        error: result.as_ref().err().cloned(),
                     });
                 }
                 if let Some(f) = done {
+                    // 先落盘再返回：即使紧接着进程崩溃，记录也不会丢。
+                    if let Err(e) = store::append_history(&f) {
+                        eprintln!("⚠️  写入下载记录失败: {e:#}");
+                    }
                     st.finished.push(f);
                     if st.finished.len() > 50 {
                         st.finished.remove(0);
                     }
                 }
                 drop(st);
+                dirty = true;
             }
+                }
+            }
+            _ = tick.tick() => {}
         }
-        dispatch(&state, &ctx, &tx);
+        if dispatch(&state, &ctx, &tx) > 0 {
+            dirty = true;
+        }
+        if dirty {
+            let snapshot = {
+                let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                persisted(&st)
+            };
+            if let Err(e) = store::save_state(&snapshot) {
+                eprintln!("⚠️  保存下载队列失败: {e:#}");
+            }
+            dirty = false;
+        }
+    }
+
+    // 所有发送端都退出（守护进程收尾）：把最终队列落盘。
+    let snapshot = {
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        persisted(&st)
+    };
+    if let Err(e) = store::save_state(&snapshot) {
+        eprintln!("⚠️  保存下载队列失败: {e:#}");
     }
 }
 
 /// 为每个服务器启动尽可能多的下载任务（不超过该服务器自己的并发数）。
+/// 返回本次派发的任务数。
 fn dispatch(
     state: &Arc<Mutex<ManagerState>>,
     ctx: &BTreeMap<String, ServerCtx>,
     tx: &mpsc::UnboundedSender<Cmd>,
-) {
+) -> usize {
     let mut spawns = Vec::new();
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         for (server, ss) in st.servers.iter_mut() {
             let Some(c) = ctx.get(server) else { continue };
+            // 服务器处在长时间限流窗口内时不要继续派发，否则任务会立刻失败。
+            if download::server_rate_limited(&c.client.server).is_some() {
+                continue;
+            }
             while ss.active.len() < ss.max_jobs.max(1) {
                 let Some(job) = ss.queue.pop_front() else { break };
                 let pb = ProgressBar::hidden();
@@ -288,6 +578,8 @@ fn dispatch(
                     title: job.title.clone(),
                     pb: pb.clone(),
                     started: Instant::now(),
+                    item: job.item.clone(),
+                    opts: job.opts.clone(),
                 });
                 spawns.push((
                     server.clone(),
@@ -301,6 +593,7 @@ fn dispatch(
         }
     }
 
+    let count = spawns.len();
     for (server, job, client, limiter, cancel, pb) in spawns {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -334,4 +627,5 @@ fn dispatch(
             });
         });
     }
+    count
 }

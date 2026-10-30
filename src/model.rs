@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Item {
     pub id: String,
@@ -30,21 +30,22 @@ pub struct Item {
     pub recursive_item_count: Option<i64>,
     pub media_sources: Option<Vec<MediaSource>>,
     pub media_streams: Option<Vec<MediaStream>>,
-    /// 非 API 字段：直接给一个 http(s) 直链时用它，跳过 URL 构造
-    #[serde(skip)]
+    /// 非 API 字段：直接给一个 http(s) 直链时用它，跳过 URL 构造。
+    /// 这些字段需要随队列一起落盘（TUI 退出后由后台进程继续下载）。
+    #[serde(default)]
     pub direct_url: Option<String>,
     /// 非 API 字段：展开剧集时从 Series 容器/路径补全的剧集年份
-    #[serde(skip)]
+    #[serde(default)]
     pub series_year: Option<i32>,
     /// 非 API 字段：多版本时选中的版本名称（用于文件名区分）
-    #[serde(skip)]
+    #[serde(default)]
     pub version: Option<String>,
     /// 非 API 字段：本次下载里同一条目存在多个版本，需要把版本名放进目录避免覆盖
-    #[serde(skip)]
+    #[serde(default)]
     pub version_scoped: bool,
     /// 非 API 字段：该条目原本有多个媒体源，已锁定其中某一个。
     /// 锁定后不能再使用 `/Items/{id}/Download` 这类无法指定媒体源的接口。
-    #[serde(skip)]
+    #[serde(default)]
     pub source_locked: bool,
 }
 
@@ -193,7 +194,7 @@ fn parse_season_dir(path: &str) -> Option<i32> {
     None
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaSource {
     pub id: Option<String>,
@@ -208,7 +209,7 @@ pub struct MediaSource {
     pub is_remote: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaStream {
     pub index: Option<i32>,

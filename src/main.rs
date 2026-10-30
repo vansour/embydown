@@ -2,11 +2,13 @@
 
 mod cli;
 mod config;
+mod daemon;
 mod download;
 mod emby;
 mod manager;
 mod model;
 mod naming;
+mod store;
 mod table;
 mod tui;
 mod util;
@@ -42,6 +44,8 @@ async fn run(cli: Cli) -> Result<()> {
     };
     match cmd {
         Cmd::Ui => tui::run().await,
+        Cmd::Daemon => daemon::run().await,
+        Cmd::History { limit } => print_history(limit),
         Cmd::Login(args) => login(args).await,
         Cmd::Logout { name } => logout(name),
         Cmd::Servers => list_servers(),
@@ -140,6 +144,88 @@ fn logout(name: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `embydown history`：读取守护进程永久保存的下载记录（最新在前）。
+fn print_history(limit: usize) -> Result<()> {
+    let records = store::load_history();
+    if records.is_empty() {
+        println!("暂无下载记录");
+        return Ok(());
+    }
+    let shown = if limit == 0 {
+        records.len()
+    } else {
+        limit.min(records.len())
+    };
+    println!(
+        "{:<19}  {:<16} {:<6} {:>10}  NAME",
+        "TIME (UTC)", "SERVER", "STATUS", "SIZE"
+    );
+    println!("{}", "-".repeat(96));
+    for rec in records.iter().rev().take(shown) {
+        let f = &rec.entry;
+        let status = match f.status {
+            manager::FinishedStatus::Done => "完成",
+            manager::FinishedStatus::Skipped => "跳过",
+            manager::FinishedStatus::Failed => "失败",
+            manager::FinishedStatus::Cancelled => "取消",
+        };
+        println!(
+            "{:<19}  {} {} {:>10}  {}",
+            util::format_unix_time(rec.time_unix),
+            pad_display(&truncate_display(&f.server, 16), 16),
+            pad_display(status, 6),
+            format_bytes(f.bytes),
+            f.title
+        );
+        if f.status == manager::FinishedStatus::Failed
+            && let Some(err) = &f.error
+        {
+            let brief = err.lines().next().unwrap_or(err);
+            println!("    ↳ {}", truncate_display(brief, 88));
+        }
+    }
+    println!(
+        "\n共 {} 条记录（显示 {} 条）；记录保存在 {}",
+        records.len(),
+        shown,
+        store::history_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "history.jsonl".into())
+    );
+    Ok(())
+}
+
+/// 按显示宽度截断（用于表格对齐；中文按 2 列计）。
+fn truncate_display(s: &str, width: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(s) <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+/// 按显示宽度补空格（中文按 2 列计），用于终端表格对齐。
+fn pad_display(s: &str, width: usize) -> String {
+    let used = unicode_width::UnicodeWidthStr::width(s);
+    if used >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + width - used);
+    out.push_str(s);
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
 }
 
 fn list_servers() -> Result<()> {
@@ -385,8 +471,8 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             download::execute(&client, items, opts).await?;
         }
 
-        Cmd::Login(_) | Cmd::Logout { .. } | Cmd::Servers | Cmd::Ui => {
-            unreachable!("login/logout/servers/ui 已在 run() 中处理")
+        Cmd::Login(_) | Cmd::Logout { .. } | Cmd::Servers | Cmd::Ui | Cmd::Daemon | Cmd::History { .. } => {
+            unreachable!("login/logout/servers/ui/daemon/history 已在 run() 中处理")
         }
     }
 
@@ -1775,6 +1861,16 @@ fn print_detail(item: &Item) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_padding_counts_cjk_as_two_columns() {
+        let padded = pad_display("（直链）", 16);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(padded.as_str()), 16);
+        assert_eq!(padded.trim_end(), "（直链）");
+
+        // 已经达到或超过宽度时不再追加空格。
+        assert_eq!(pad_display("media.micu.hk", 8), "media.micu.hk");
+    }
 
     fn ep(id: &str, season: i32, num: i32, labels: &[&str]) -> Item {
         let sources: Vec<MediaSource> = labels
