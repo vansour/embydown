@@ -27,11 +27,15 @@ pub struct ManagerState {
     /// 最近完成的下载（最多保留 50 条；完整历史在 history.jsonl）
     pub finished: Vec<Finished>,
     seq: u64,
+    /// 每次派发递增，用于区分同一任务的旧/新下载实例。
+    attempt_seq: u64,
 }
 
 #[derive(Default)]
 pub struct ServerState {
     pub queue: VecDeque<PendingJob>,
+    /// 失败的最近任务，可单独重试（不落盘）。
+    pub retryable: VecDeque<PendingJob>,
     pub active: Vec<ActiveJob>,
     pub max_jobs: usize,
     pub done: usize,
@@ -40,7 +44,6 @@ pub struct ServerState {
     pub skipped: usize,
     pub subs: usize,
     pub bytes: u64,
-    pub stop_requested: bool,
     /// 用户暂停：不再派发新任务，正在运行的任务已放回队首（保留 .part）。
     pub paused: bool,
     /// 重建后台任务用的连接参数（随队列一起落盘）。
@@ -56,9 +59,13 @@ pub struct PendingJob {
 
 pub struct ActiveJob {
     pub id: u64,
+    /// 本次派发的唯一编号：暂停后重新派发同一任务时，旧实例的完成消息不会误伤新实例。
+    pub attempt: u64,
     pub title: String,
     pub pb: ProgressBar,
     pub started: Instant,
+    /// 单任务取消标记：不影响同一服务器的其他下载。
+    pub cancel: Arc<AtomicBool>,
     item: Item,
     opts: DownloadOpts,
 }
@@ -96,6 +103,8 @@ pub struct Snapshot {
 pub struct ServerView {
     pub queue: Vec<QueueView>,
     pub active: Vec<ActiveView>,
+    /// 失败后可重试的任务。
+    pub retryable: Vec<QueueView>,
     pub max_jobs: usize,
     pub done: usize,
     pub failed: usize,
@@ -110,6 +119,13 @@ pub struct ServerView {
 pub struct QueueView {
     pub id: u64,
     pub title: String,
+    /// 剧集信息：用于队列按“剧名 + 季”聚合显示。
+    #[serde(default)]
+    pub series: Option<String>,
+    #[serde(default)]
+    pub season: Option<i32>,
+    #[serde(default)]
+    pub episode: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -131,6 +147,14 @@ enum Cmd {
     Enqueue(Box<EnqueueCmd>),
     CancelServer(String),
     CancelAll,
+    CancelJob {
+        server: String,
+        id: u64,
+    },
+    RetryJob {
+        server: String,
+        id: u64,
+    },
     PauseServer(String),
     ResumeServer(String),
     PauseAll,
@@ -138,7 +162,7 @@ enum Cmd {
     ClearFinished,
     Completed {
         server: String,
-        id: u64,
+        attempt: u64,
         result: Result<download::OneResult, String>,
         cancelled: bool,
     },
@@ -154,7 +178,6 @@ struct EnqueueCmd {
 struct ServerCtx {
     client: Client,
     limiter: Arc<Limiter>,
-    cancel: Arc<AtomicBool>,
 }
 
 impl Manager {
@@ -183,6 +206,22 @@ impl Manager {
 
     pub fn cancel_all(&self) {
         let _ = self.tx.send(Cmd::CancelAll);
+    }
+
+    /// 取消单个排队或运行中的任务。
+    pub fn cancel_job(&self, server: &str, id: u64) {
+        let _ = self.tx.send(Cmd::CancelJob {
+            server: server.to_string(),
+            id,
+        });
+    }
+
+    /// 重试一个失败的任务。
+    pub fn retry_job(&self, server: &str, id: u64) {
+        let _ = self.tx.send(Cmd::RetryJob {
+            server: server.to_string(),
+            id,
+        });
     }
 
     pub fn pause_server(&self, server: &str) {
@@ -219,7 +258,7 @@ impl Manager {
     pub fn flush(&self) {
         let st = self.state();
         if let Err(e) = store::save_state(&persisted(&st)) {
-            eprintln!("⚠️  保存下载队列失败: {e:#}");
+            eprintln!("! 保存下载队列失败: {e:#}");
         }
     }
 }
@@ -231,14 +270,7 @@ fn snapshot_of(st: &ManagerState) -> Snapshot {
             .iter()
             .map(|(name, ss)| {
                 let view = ServerView {
-                    queue: ss
-                        .queue
-                        .iter()
-                        .map(|q| QueueView {
-                            id: q.id,
-                            title: q.title.clone(),
-                        })
-                        .collect(),
+                    queue: ss.queue.iter().map(queue_view).collect(),
                     active: ss
                         .active
                         .iter()
@@ -250,6 +282,7 @@ fn snapshot_of(st: &ManagerState) -> Snapshot {
                             elapsed_secs: a.started.elapsed().as_secs_f64(),
                         })
                         .collect(),
+                    retryable: ss.retryable.iter().map(queue_view).collect(),
                     max_jobs: ss.max_jobs,
                     done: ss.done,
                     failed: ss.failed,
@@ -263,6 +296,36 @@ fn snapshot_of(st: &ManagerState) -> Snapshot {
             })
             .collect(),
         finished: st.finished.clone(),
+    }
+}
+
+/// 把队列任务转换成界面快照；剧集附带剧名/季/集，供队列按季聚合。
+fn queue_view(job: &PendingJob) -> QueueView {
+    let (series, season, episode) = if job.item.item_type.as_deref() == Some("Episode") {
+        let series = job
+            .item
+            .series_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        match series {
+            Some(series) => (
+                Some(series),
+                Some(job.item.season_no()),
+                Some(job.item.episode_no()).filter(|episode| *episode > 0),
+            ),
+            None => (None, None, None),
+        }
+    } else {
+        (None, None, None)
+    };
+    QueueView {
+        id: job.id,
+        title: job.title.clone(),
+        series,
+        season,
+        episode,
     }
 }
 
@@ -349,6 +412,7 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
                 name,
                 ServerState {
                     queue: pending,
+                    retryable: VecDeque::new(),
                     active: Vec::new(),
                     max_jobs: ps.max_jobs.clamp(1, 8),
                     done: ps.done,
@@ -357,7 +421,6 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
                     skipped: ps.skipped,
                     subs: ps.subs,
                     bytes: ps.bytes,
-                    stop_requested: false,
                     paused: ps.paused,
                     creds,
                 },
@@ -379,7 +442,7 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
     for (name, ss) in &st.servers {
         let Some(creds) = &ss.creds else { continue };
         let Ok(client) = Client::from_creds(creds) else {
-            eprintln!("⚠️  无法为 {name} 恢复下载连接，队列将等待下次入队时刷新");
+            eprintln!("! 无法为 {name} 恢复下载连接，队列将等待下次入队时刷新");
             continue;
         };
         let rate = ss
@@ -392,7 +455,6 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
             ServerCtx {
                 client,
                 limiter: Arc::new(Limiter::new(rate)),
-                cancel: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -421,6 +483,40 @@ fn requeue_active(ss: &mut ServerState) {
     }
 }
 
+/// 取消单个任务：排队中的直接移除，运行中的设置取消标记。
+fn cancel_job_in(state: &mut ManagerState, server: &str, id: u64) -> bool {
+    let Some(ss) = state.servers.get_mut(server) else {
+        return false;
+    };
+    if let Some(pos) = ss.queue.iter().position(|job| job.id == id) {
+        ss.queue.remove(pos);
+        return true;
+    }
+    if let Some(job) = ss.active.iter().find(|job| job.id == id) {
+        job.cancel.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// 把一个失败任务重新放回队尾（分配新的任务编号）。
+fn retry_job_in(state: &mut ManagerState, server: &str, id: u64) -> bool {
+    let new_id = state.seq + 1;
+    let job = state.servers.get_mut(server).and_then(|ss| {
+        let pos = ss.retryable.iter().position(|job| job.id == id)?;
+        ss.retryable.remove(pos)
+    });
+    let Some(mut job) = job else {
+        return false;
+    };
+    state.seq = new_id;
+    job.id = new_id;
+    if let Some(ss) = state.servers.get_mut(server) {
+        ss.queue.push_back(job);
+    }
+    true
+}
+
 async fn run(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     tx: mpsc::UnboundedSender<Cmd>,
@@ -443,16 +539,11 @@ async fn run(
                     items,
                     opts,
                 } = *cmd;
-                let mut reset_cancel = false;
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     let start_id = st.seq;
                     st.seq += items.len() as u64;
                     let entry = st.servers.entry(server.clone()).or_default();
-                    if entry.stop_requested {
-                        entry.stop_requested = false;
-                        reset_cancel = true;
-                    }
                     entry.max_jobs = opts.jobs.clamp(1, 8);
                     entry.creds = Some(client.creds());
                     for (offset, item) in items.into_iter().enumerate() {
@@ -471,9 +562,6 @@ async fn run(
                     Some(c) => {
                         c.client = client;
                         c.limiter = Arc::new(Limiter::new(opts.limit_rate));
-                        if reset_cancel {
-                            c.cancel = Arc::new(AtomicBool::new(false));
-                        }
                     }
                     None => {
                         ctx.insert(
@@ -481,7 +569,6 @@ async fn run(
                             ServerCtx {
                                 client,
                                 limiter: Arc::new(Limiter::new(opts.limit_rate)),
-                                cancel: Arc::new(AtomicBool::new(false)),
                             },
                         );
                     }
@@ -489,12 +576,11 @@ async fn run(
                 dirty = true;
             }
             Cmd::CancelServer(server) => {
-                if let Some(c) = ctx.get(&server) {
-                    c.cancel.store(true, Ordering::SeqCst);
-                }
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ss) = st.servers.get_mut(&server) {
-                    ss.stop_requested = true;
+                    for job in &ss.active {
+                        job.cancel.store(true, Ordering::SeqCst);
+                    }
                     ss.paused = false;
                     ss.queue.clear();
                 }
@@ -502,28 +588,39 @@ async fn run(
                 dirty = true;
             }
             Cmd::CancelAll => {
-                for c in ctx.values() {
-                    c.cancel.store(true, Ordering::SeqCst);
-                }
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 for ss in st.servers.values_mut() {
-                    ss.stop_requested = true;
+                    for job in &ss.active {
+                        job.cancel.store(true, Ordering::SeqCst);
+                    }
                     ss.paused = false;
                     ss.queue.clear();
                 }
                 drop(st);
                 dirty = true;
             }
+            Cmd::CancelJob { server, id } => {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                cancel_job_in(&mut st, &server, id);
+                drop(st);
+                dirty = true;
+            }
+            Cmd::RetryJob { server, id } => {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                retry_job_in(&mut st, &server, id);
+                drop(st);
+                dirty = true;
+            }
             Cmd::PauseServer(server) => {
-                if let Some(c) = ctx.get(&server) {
-                    c.cancel.store(true, Ordering::SeqCst);
-                }
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(ss) = st.servers.get_mut(&server)
                         && !ss.paused
                     {
                         ss.paused = true;
+                        for job in &ss.active {
+                            job.cancel.store(true, Ordering::SeqCst);
+                        }
                         requeue_active(ss);
                     }
                 }
@@ -534,23 +631,18 @@ async fn run(
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(ss) = st.servers.get_mut(&server) {
                         ss.paused = false;
-                        ss.stop_requested = false;
                     }
-                }
-                if let Some(c) = ctx.get_mut(&server) {
-                    // 旧的取消标记已经被暂停时放回队首的任务继承；继续时换一个新的。
-                    c.cancel = Arc::new(AtomicBool::new(false));
                 }
                 dirty = true;
             }
             Cmd::PauseAll => {
-                for c in ctx.values() {
-                    c.cancel.store(true, Ordering::SeqCst);
-                }
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 for ss in st.servers.values_mut() {
                     if !ss.paused {
                         ss.paused = true;
+                        for job in &ss.active {
+                            job.cancel.store(true, Ordering::SeqCst);
+                        }
                         requeue_active(ss);
                     }
                 }
@@ -562,11 +654,7 @@ async fn run(
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     for ss in st.servers.values_mut() {
                         ss.paused = false;
-                        ss.stop_requested = false;
                     }
-                }
-                for c in ctx.values_mut() {
-                    c.cancel = Arc::new(AtomicBool::new(false));
                 }
                 dirty = true;
             }
@@ -574,21 +662,24 @@ async fn run(
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     st.finished.clear();
+                    for ss in st.servers.values_mut() {
+                        ss.retryable.clear();
+                    }
                 }
                 if let Err(e) = store::clear_history() {
-                    eprintln!("⚠️  清空下载记录失败: {e:#}");
+                    eprintln!("! 清空下载记录失败: {e:#}");
                 }
             }
             Cmd::Completed {
                 server,
-                id,
+                attempt,
                 result,
                 cancelled,
             } => {
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 let mut done = None;
                 if let Some(ss) = st.servers.get_mut(&server)
-                    && let Some(pos) = ss.active.iter().position(|a| a.id == id)
+                    && let Some(pos) = ss.active.iter().position(|a| a.attempt == attempt)
                 {
                     let job = ss.active.remove(pos);
                     let status = match &result {
@@ -611,6 +702,24 @@ async fn run(
                             FinishedStatus::Failed
                         }
                     };
+                    if status == FinishedStatus::Failed {
+                        let ActiveJob {
+                            id,
+                            title,
+                            item,
+                            opts,
+                            ..
+                        } = &job;
+                        ss.retryable.push_back(PendingJob {
+                            id: *id,
+                            title: title.clone(),
+                            item: item.clone(),
+                            opts: opts.clone(),
+                        });
+                        if ss.retryable.len() > 50 {
+                            ss.retryable.pop_front();
+                        }
+                    }
                     done = Some(Finished {
                         server: server.clone(),
                         title: job.title,
@@ -622,7 +731,7 @@ async fn run(
                 if let Some(f) = done {
                     // 先落盘再返回：即使紧接着进程崩溃，记录也不会丢。
                     if let Err(e) = store::append_history(&f) {
-                        eprintln!("⚠️  写入下载记录失败: {e:#}");
+                        eprintln!("! 写入下载记录失败: {e:#}");
                     }
                     st.finished.push(f);
                     if st.finished.len() > 50 {
@@ -645,7 +754,7 @@ async fn run(
                 persisted(&st)
             };
             if let Err(e) = store::save_state(&snapshot) {
-                eprintln!("⚠️  保存下载队列失败: {e:#}");
+                eprintln!("! 保存下载队列失败: {e:#}");
             }
             dirty = false;
         }
@@ -657,7 +766,7 @@ async fn run(
         persisted(&st)
     };
     if let Err(e) = store::save_state(&snapshot) {
-        eprintln!("⚠️  保存下载队列失败: {e:#}");
+        eprintln!("! 保存下载队列失败: {e:#}");
     }
 }
 
@@ -671,6 +780,7 @@ fn dispatch(
     let mut spawns = Vec::new();
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut attempt_seq = st.attempt_seq;
         for (server, ss) in st.servers.iter_mut() {
             let Some(c) = ctx.get(server) else { continue };
             // 用户暂停后不派发新任务；继续时由 update 循环重新触发。
@@ -685,28 +795,35 @@ fn dispatch(
                 let Some(job) = ss.queue.pop_front() else { break };
                 let pb = ProgressBar::hidden();
                 pb.set_message(job.title.clone());
+                let cancel = Arc::new(AtomicBool::new(false));
+                attempt_seq += 1;
+                let attempt = attempt_seq;
                 ss.active.push(ActiveJob {
                     id: job.id,
+                    attempt,
                     title: job.title.clone(),
                     pb: pb.clone(),
                     started: Instant::now(),
+                    cancel: Arc::clone(&cancel),
                     item: job.item.clone(),
                     opts: job.opts.clone(),
                 });
                 spawns.push((
                     server.clone(),
                     job,
+                    attempt,
                     c.client.clone(),
                     Arc::clone(&c.limiter),
-                    Arc::clone(&c.cancel),
+                    cancel,
                     pb,
                 ));
             }
         }
+        st.attempt_seq = attempt_seq;
     }
 
     let count = spawns.len();
-    for (server, job, client, limiter, cancel, pb) in spawns {
+    for (server, job, attempt, client, limiter, cancel, pb) in spawns {
         let tx = tx.clone();
         tokio::spawn(async move {
             use futures_util::FutureExt;
@@ -733,7 +850,7 @@ fn dispatch(
             };
             let _ = tx.send(Cmd::Completed {
                 server,
-                id: job.id,
+                attempt,
                 result,
                 cancelled,
             });
@@ -761,9 +878,11 @@ mod tests {
     fn active(id: u64) -> ActiveJob {
         ActiveJob {
             id,
+            attempt: id,
             title: format!("任务 {id}"),
             pb: ProgressBar::hidden(),
             started: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
             item: Item {
                 id: format!("item{id}"),
                 ..Default::default()
@@ -787,5 +906,36 @@ mod tests {
         let ids: Vec<u64> = ss.queue.iter().map(|j| j.id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
         assert!(ss.paused);
+    }
+
+    #[test]
+    fn cancel_and_retry_single_jobs() {
+        let mut st = ManagerState::default();
+        let mut ss = ServerState::default();
+        ss.queue.push_back(pending(1));
+        ss.queue.push_back(pending(2));
+        ss.active.push(active(3));
+        ss.retryable.push_back(pending(4));
+        st.servers.insert("media".into(), ss);
+        st.seq = 10;
+
+        // 排队任务直接移除；运行中的任务只设置自己的取消标记。
+        assert!(cancel_job_in(&mut st, "media", 1));
+        let ids: Vec<u64> = st.servers["media"].queue.iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![2]);
+        assert!(cancel_job_in(&mut st, "media", 3));
+        assert!(
+            st.servers["media"].active[0]
+                .cancel
+                .load(Ordering::SeqCst)
+        );
+        assert!(!cancel_job_in(&mut st, "media", 99));
+
+        // 重试分配新编号并移到队尾。
+        assert!(retry_job_in(&mut st, "media", 4));
+        assert_eq!(st.servers["media"].queue.back().unwrap().id, 11);
+        assert!(st.servers["media"].retryable.is_empty());
+        assert_eq!(st.seq, 11);
+        assert!(!retry_job_in(&mut st, "media", 4));
     }
 }

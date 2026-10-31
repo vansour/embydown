@@ -1,12 +1,10 @@
 //! embydown —— Emby 媒体下载工具（默认直链）。
 
 mod cli;
-mod cd2;
 mod config;
 mod daemon;
 mod download;
 mod emby;
-mod instant;
 mod interactive;
 mod manager;
 mod model;
@@ -38,7 +36,7 @@ async fn main() {
     let cli = Cli::parse();
     util::set_verbose(cli.verbose);
     if let Err(err) = run(cli).await {
-        eprintln!("\n❌ {}", crate::emby::redact_text(&format!("{err:#}")));
+        eprintln!("\n✗ {}", crate::emby::redact_text(&format!("{err:#}")));
         std::process::exit(1);
     }
 }
@@ -82,32 +80,6 @@ async fn run(cli: Cli) -> Result<()> {
             temp,
             final_dir,
         } => review::sync(temp, final_dir, dry_run, force),
-        Cmd::UploadTest {
-            server,
-            target,
-            limit,
-            cd2_url,
-            cd2_token,
-            window,
-            keep,
-            temp,
-            final_dir,
-        } => {
-            instant::run(
-                &target,
-                server.server.as_deref(),
-                limit,
-                instant::Options {
-                    cd2_url,
-                    cd2_token,
-                    window: std::time::Duration::from_secs(window.max(1)),
-                    keep,
-                    temp_dir: temp,
-                    final_dir,
-                },
-            )
-            .await
-        }
         cmd => run_command(cmd).await,
     }
 }
@@ -154,7 +126,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     if let Some(old) = replaced
         && old.server != client.server
     {
-        println!("⚠️  已覆盖同名服务器 {name}（原地址 {}）", old.server);
+        println!("! 已覆盖同名服务器 {name}（原地址 {}）", old.server);
     }
     match username {
         Some(u) => println!("✅ 已登录 {}（名称 {name}，用户 {u}）", client.server),
@@ -543,12 +515,11 @@ async fn run_command(cmd: Cmd) -> Result<()> {
         | Cmd::Update { .. }
         | Cmd::Review { .. }
         | Cmd::Sync { .. }
-        | Cmd::UploadTest { .. }
         | Cmd::History { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. } => {
             unreachable!(
-                "login/logout/servers/ui/daemon/update/review/sync/upload-test/history/pause/resume 已在 run() 中处理"
+                "login/logout/servers/ui/daemon/update/review/sync/history/pause/resume 已在 run() 中处理"
             )
         }
     }
@@ -568,7 +539,10 @@ async fn preview_matches(
     for (name, profile) in &targets {
         match client_for(name, profile).await {
             Ok(c) => clients.push((name.clone(), c)),
-            Err(e) => eprintln!("⚠️  {name} 连接失败: {e:#}"),
+            Err(e) => eprintln!(
+                "! {name} 连接失败: {}",
+                crate::emby::redact_text(&format!("{e:#}"))
+            ),
         }
     }
     if clients.is_empty() {
@@ -619,7 +593,10 @@ async fn preview_matches(
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("⚠️  {name} 搜索失败: {e:#}");
+                eprintln!(
+                    "! {name} 搜索失败: {}",
+                    crate::emby::redact_text(&format!("{e:#}"))
+                );
             }
         }
     }
@@ -881,7 +858,11 @@ async fn search_rows(server: &str, client: &Client, item: Item) -> Vec<SearchRow
                 }
             }
             Err(e) => {
-                eprintln!("⚠️  {server} 展开 {} 失败: {e:#}", item.title());
+                eprintln!(
+                    "! {server} 展开 {} 失败: {}",
+                    item.title(),
+                    crate::emby::redact_text(&format!("{e:#}"))
+                );
                 vec![basic_row(server, &item)]
             }
         };
@@ -1079,7 +1060,10 @@ async fn pick_item(
             Ok(item) => return Ok((name.to_string(), client, item)),
             Err(e) => {
                 util::vlog(1, format!("  ↳ {name} 上未找到 ID {target}，尝试按名称搜索…"));
-                util::vlog(2, format!("    {e:#}"));
+                util::vlog(
+                    2,
+                    format!("    {}", crate::emby::redact_text(&format!("{e:#}"))),
+                );
             }
         }
         let found = search_clients(vec![(name.to_string(), client)], target, limit).await;
@@ -1104,7 +1088,10 @@ async fn pick_item(
     for (name, profile) in &cfg.servers {
         match client_for(name, profile).await {
             Ok(c) => clients.push((name.clone(), c)),
-            Err(e) => eprintln!("⚠️  {name} 连接失败: {e:#}"),
+            Err(e) => eprintln!(
+                "! {name} 连接失败: {}",
+                crate::emby::redact_text(&format!("{e:#}"))
+            ),
         }
     }
     if clients.is_empty() {
@@ -1126,7 +1113,13 @@ async fn pick_item(
     for (name, client, res) in results {
         match res {
             Ok(item) => found.push((name, client, item)),
-            Err(e) => util::vlog(2, format!("  ↳ {name} 未找到 ID {target}: {e:#}")),
+            Err(e) => util::vlog(
+                    2,
+                    format!(
+                        "  ↳ {name} 未找到 ID {target}: {}",
+                        crate::emby::redact_text(&format!("{e:#}"))
+                    ),
+                ),
         }
     }
     if !found.is_empty() {
@@ -1166,7 +1159,10 @@ async fn search_clients(
                     found.push((name.clone(), client.clone(), item));
                 }
             }
-            Err(e) => eprintln!("⚠️  {name} 搜索失败: {e:#}"),
+            Err(e) => eprintln!(
+                    "! {name} 搜索失败: {}",
+                    crate::emby::redact_text(&format!("{e:#}"))
+                ),
         }
     }
     // 合并多服务器结果后按相关度排序，ID 找不到时的自动选择也依赖这个顺序。
@@ -1312,7 +1308,7 @@ fn apply_version_choice(items: &mut Vec<Item>, arg: Option<&str>) -> Result<()> 
                 bail!("版本 “{target}” 下没有可下载的条目");
             }
             if skipped > 0 {
-                println!("ℹ️  版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
+                println!("· 版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
             }
             *items = kept;
         }
@@ -1321,14 +1317,14 @@ fn apply_version_choice(items: &mut Vec<Item>, arg: Option<&str>) -> Result<()> 
             match versions.len() {
                 0 => {
                     eprintln!(
-                        "⚠️  检测到多个版本但无法识别版本名；请用 --version 指定，或 --version all 全部下载"
+                        "! 检测到多个版本但无法识别版本名；请用 --version 指定，或 --version all 全部下载"
                     );
                 }
                 1 => {
                     let target = versions[0].label.clone();
                     let (kept, skipped) = filter_to_version(std::mem::take(items), &target);
                     if skipped > 0 {
-                        println!("ℹ️  版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
+                        println!("· 版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
                     }
                     *items = kept;
                 }
@@ -1340,7 +1336,7 @@ fn apply_version_choice(items: &mut Vec<Item>, arg: Option<&str>) -> Result<()> 
                         bail!("版本 “{target}” 下没有可下载的条目");
                     }
                     if skipped > 0 {
-                        println!("ℹ️  版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
+                        println!("· 版本 “{target}”：跳过 {skipped} 个不含该版本的条目");
                     }
                     *items = kept;
                 }

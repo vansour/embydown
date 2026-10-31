@@ -1,9 +1,9 @@
 //! 本地审查与临时 → 最终文件夹同步。
 //!
-//! 审查在本地完成，不访问服务器：
-//! - 统计视频/字幕/元数据/图片与总大小；
+//! 审查在本地完成，不访问服务器，也不打开文件读取内容：
+//! - 只依据目录项（文件名/路径与大小）统计视频/字幕/元数据/图片与总大小；
 //! - 按 `SxxExx` 识别剧集，检查集号连续性（缺集）与重复集；
-//! - 检查空文件、HTML 错误页、视频文件头异常、`.part` 等未完成文件；
+//! - 检查空文件、过小视频与 `.part` 等未完成文件；
 //! - 对比临时/最终文件夹，列出待复制、待覆盖、仅最终有等差异。
 //!
 //! 同步默认只复制缺失文件和大小不一致的文件；`.part`、异常文件会被跳过，
@@ -22,7 +22,6 @@ use crate::util::{self, format_bytes, verbose};
 
 const MAX_DEPTH: usize = 32;
 const LIST_LIMIT: usize = 20;
-const HEADER_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -206,7 +205,7 @@ pub fn sync(
         format_bytes(copied_bytes)
     );
     if !failures.is_empty() {
-        println!("❌ 失败 {} 个：", failures.len());
+        println!("✗ 失败 {} 个：", failures.len());
         for failure in &failures {
             println!("   - {failure}");
         }
@@ -317,7 +316,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors:
             continue;
         };
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        let (kind, error) = classify_and_check(&path, rel, size);
+        let (kind, error) = classify_and_check(rel, size);
         let (series, season, episode) = if kind == Kind::Video {
             parse_episode(rel)
         } else {
@@ -335,7 +334,8 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors:
     }
 }
 
-fn classify_and_check(path: &Path, rel: &Path, size: u64) -> (Kind, Option<String>) {
+/// 仅依据目录项判断：文件名决定类型，大小来自目录项，不打开文件。
+fn classify_and_check(rel: &Path, size: u64) -> (Kind, Option<String>) {
     let name = rel
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -347,22 +347,8 @@ fn classify_and_check(path: &Path, rel: &Path, size: u64) -> (Kind, Option<Strin
     if size == 0 {
         return (kind, Some("空文件（0 字节）".into()));
     }
-    let mut header = [0u8; HEADER_BYTES];
-    let read = match File::open(path).and_then(|mut file| file.read(&mut header)) {
-        Ok(read) => read,
-        Err(e) => return (kind, Some(format!("无法读取文件头：{e}"))),
-    };
-    let header = &header[..read];
-    if looks_like_html(header) {
-        return (kind, Some("内容是 HTML（可能是下载错误页）".into()));
-    }
-    if kind == Kind::Video {
-        if let Some(error) = video_header_error(header, &name) {
-            return (kind, Some(error));
-        }
-        if size < 1024 {
-            return (kind, Some(format!("文件过小（{}）", format_bytes(size))));
-        }
+    if kind == Kind::Video && size < 1024 {
+        return (kind, Some(format!("文件过小（{}）", format_bytes(size))));
     }
     (kind, None)
 }
@@ -385,37 +371,6 @@ fn classify(name: &str) -> Kind {
         "nfo" | "xml" => Kind::Metadata,
         "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" => Kind::Artwork,
         _ => Kind::Other,
-    }
-}
-
-fn looks_like_html(header: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(header).to_ascii_lowercase();
-    text.contains("<html") || text.contains("<!doctype html")
-}
-
-fn video_header_error(header: &[u8], name: &str) -> Option<String> {
-    let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-    let ok = match ext {
-        "mkv" | "webm" => header.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
-        "mp4" | "m4v" | "mov" | "3gp" => header.len() >= 8 && &header[4..8] == b"ftyp",
-        "avi" => header.len() >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"AVI ",
-        "flv" => header.starts_with(b"FLV"),
-        "wmv" => header.starts_with(&[0x30, 0x26, 0xB2, 0x75]),
-        "rmvb" | "rm" => header.starts_with(b".RMF"),
-        "ts" => header.first() == Some(&0x47),
-        "m2ts" | "mts" => header.first() == Some(&0x47) || (header.len() > 4 && header[4] == 0x47),
-        "mpg" | "mpeg" | "vob" => {
-            header.starts_with(&[0x00, 0x00, 0x01, 0xBA])
-                || header.starts_with(&[0x00, 0x00, 0x01, 0xB3])
-        }
-        "ogv" => header.starts_with(b"OggS"),
-        // 不认识的容器不做判断，避免误报。
-        _ => true,
-    };
-    if ok {
-        None
-    } else {
-        Some("文件头与扩展名不匹配（可能损坏或不是视频）".into())
     }
 }
 
@@ -579,7 +534,7 @@ fn print_folder(report: &FolderReport, label: &str) {
     if !report.exists {
         println!("  不存在");
         for error in &report.scan_errors {
-            println!("  ⚠️  {error}");
+            println!("  ! {error}");
         }
         return;
     }
@@ -595,7 +550,7 @@ fn print_folder(report: &FolderReport, label: &str) {
         report.incomplete,
     );
     for error in &report.scan_errors {
-        println!("  ⚠️  {error}");
+        println!("  ! {error}");
     }
     if report.files.is_empty() {
         println!("  （空文件夹）");
@@ -1004,9 +959,20 @@ mod tests {
     }
 
     #[test]
-    fn detects_html_error_pages() {
-        assert!(looks_like_html(b"<!DOCTYPE html><html>error</html>"));
-        assert!(!looks_like_html(&[0x1A, 0x45, 0xDF, 0xA3]));
+    fn flags_empty_and_tiny_videos_without_opening_files() {
+        let (kind, error) = classify_and_check(Path::new("movie.mkv"), 0);
+        assert_eq!(kind, Kind::Video);
+        assert!(error.unwrap().contains("空文件"));
+
+        let (_, error) = classify_and_check(Path::new("movie.mkv"), 512);
+        assert!(error.unwrap().contains("文件过小"));
+
+        let (_, error) = classify_and_check(Path::new("movie.mkv"), 2048);
+        assert!(error.is_none());
+
+        let (kind, error) = classify_and_check(Path::new("movie.mkv.part"), 0);
+        assert_eq!(kind, Kind::Incomplete);
+        assert!(error.is_none());
     }
 
     #[test]

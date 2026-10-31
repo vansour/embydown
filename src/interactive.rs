@@ -6,9 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::join_all;
+use rustyline::error::ReadlineError;
+use rustyline::{Config as EditorConfig, DefaultEditor};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cli::LoginArgs;
@@ -16,7 +20,7 @@ use crate::config::{self, Config, Profile, Settings};
 use crate::daemon::DaemonHandle;
 use crate::download::DownloadOpts;
 use crate::emby::Client;
-use crate::manager::FinishedStatus;
+use crate::manager::{Finished, FinishedStatus, Snapshot};
 use crate::model::Item;
 use crate::repair;
 use crate::table::{Align, Table};
@@ -26,6 +30,7 @@ use crate::{
 };
 
 const SEARCH_LIMIT: u32 = 30;
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 const DIRECT_SERVER: &str = "（直链）";
 const QUEUE_PREVIEW: usize = 20;
 
@@ -37,7 +42,9 @@ pub async fn run() -> Result<()> {
     let mut app = App::load().await;
     // 给后台服务一点时间返回第一份状态快照。
     tokio::time::sleep(Duration::from_millis(300)).await;
-    app.main_menu().await
+    let result = app.main_menu().await;
+    save_editor_history();
+    result
 }
 
 struct App {
@@ -50,7 +57,17 @@ struct App {
 
 impl App {
     async fn load() -> Self {
-        let cfg = config::load_optional().ok().flatten().unwrap_or_default();
+        let cfg = match config::load_optional() {
+            Ok(cfg) => cfg.unwrap_or_default(),
+            Err(e) => {
+                println!(
+                    "{} 读取配置失败：{}（本次以空配置启动）",
+                    yellow("!"),
+                    crate::emby::redact_text(&format!("{e:#}"))
+                );
+                Config::default()
+            }
+        };
         let mut app = Self {
             cfg,
             clients: BTreeMap::new(),
@@ -69,12 +86,24 @@ impl App {
             .map(|(name, profile)| (name.clone(), profile.clone()))
             .collect();
         self.clients.clear();
-        for (name, profile) in servers {
-            match crate::client_for(&name, &profile).await {
+        if servers.len() > 1 {
+            println!("{}", dim(&format!("正在连接 {} 个服务器…", servers.len())));
+        }
+        let connected = join_all(servers.into_iter().map(|(name, profile)| async move {
+            let result = crate::client_for(&name, &profile).await;
+            (name, result)
+        }))
+        .await;
+        for (name, result) in connected {
+            match result {
                 Ok(client) => {
                     self.clients.insert(name, client);
                 }
-                Err(e) => println!("⚠️  {name} 连接失败：{e:#}"),
+                Err(e) => println!(
+                    "{}  {name} 连接失败：{}",
+                    yellow("!"),
+                    crate::emby::redact_text(&format!("{e:#}"))
+                ),
             }
         }
         if let Some(name) = &self.scope
@@ -85,7 +114,17 @@ impl App {
     }
 
     async fn reload_config(&mut self) {
-        self.cfg = config::load_optional().ok().flatten().unwrap_or_default();
+        self.cfg = match config::load_optional() {
+            Ok(cfg) => cfg.unwrap_or_default(),
+            Err(e) => {
+                println!(
+                    "{} 重新读取配置失败：{}",
+                    yellow("!"),
+                    crate::emby::redact_text(&format!("{e:#}"))
+                );
+                Config::default()
+            }
+        };
         self.reconnect().await;
     }
 
@@ -127,8 +166,16 @@ impl App {
         if state.servers.is_empty() {
             return "空闲".to_string();
         }
-        let active: usize = state.servers.values().map(|server| server.active.len()).sum();
-        let queued: usize = state.servers.values().map(|server| server.queue.len()).sum();
+        let active: usize = state
+            .servers
+            .values()
+            .map(|server| server.active.len())
+            .sum();
+        let queued: usize = state
+            .servers
+            .values()
+            .map(|server| server.queue.len())
+            .sum();
         let paused = state
             .servers
             .values()
@@ -144,6 +191,12 @@ impl App {
     async fn main_menu(&mut self) -> Result<()> {
         loop {
             self.print_header();
+            if self.cfg.servers.is_empty() {
+                println!(
+                    "{}",
+                    yellow("还没有登录服务器。请选择 4) 服务器管理 添加，或运行 embydown login。")
+                );
+            }
             println!();
             println!("{} {}", cyan("▸"), bold("主菜单"));
             print_options(&[
@@ -156,16 +209,12 @@ impl App {
                 ("7)", "下载记录"),
                 ("8)", "本地审查"),
                 ("9)", "同步到最终文件夹"),
-                ("10)", "秒传测试"),
                 ("0)", "退出"),
             ]);
             println!();
-            println!(
-                "{}",
-                dim("输入编号后回车；0 返回/退出，Ctrl+C 随时退出。")
-            );
+            println!("{}", dim("输入编号后回车；0 返回/退出，Ctrl+C 随时退出。"));
 
-            let Some(choice) = prompt("选择 [0-10]：")? else {
+            let Some(choice) = prompt("选择 [0-9]：")? else {
                 break;
             };
             match choice.as_str() {
@@ -178,26 +227,56 @@ impl App {
                 "7" => run_step(self.history_menu()).await,
                 "8" => {
                     if let Err(e) = crate::review::run(None, None) {
-                        println!("{} {e:#}", red("✗"));
+                        println!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        );
                     }
                 }
                 "9" => {
                     if let Err(e) = self.sync_menu() {
-                        println!("{} {e:#}", red("✗"));
+                        println!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        );
                     }
                 }
-                "10" => run_step(self.instant_test_menu()).await,
                 "" => {}
                 "0" | "q" => break,
                 _ => println!("{} 无效选择", yellow("!")),
             }
             if let Some(err) = self.daemon.take_error() {
-                println!("{} {err}", yellow("!"));
+                println!("{} {}", yellow("!"), crate::emby::redact_text(&err));
             }
             println!();
         }
         println!();
-        println!("{} 已退出交互模式。", dim("·"));
+        let (active, queued) = {
+            let state = self.daemon.state();
+            let active: usize = state
+                .servers
+                .values()
+                .map(|server| server.active.len())
+                .sum();
+            let queued: usize = state
+                .servers
+                .values()
+                .map(|server| server.queue.len())
+                .sum();
+            (active, queued)
+        };
+        if active + queued > 0 {
+            println!(
+                "{} 已退出交互模式；后台仍有 {} 个下载中、{} 个排队，重新运行 embydown 可查看。",
+                dim("·"),
+                active,
+                queued
+            );
+        } else {
+            println!("{} 已退出交互模式。", dim("·"));
+        }
         Ok(())
     }
 
@@ -205,143 +284,158 @@ impl App {
 
     async fn search_menu(&mut self) -> Result<()> {
         print_section("搜索并下载");
-        let Some((server, item)) = self.select_source().await? else {
-            return Ok(());
-        };
-        self.prepare_download(server, item).await
+        let mut term: Option<String> = None;
+        'search: loop {
+            let term = match term.take() {
+                Some(term) => term,
+                None => {
+                    println!(
+                        "{}",
+                        dim("可输入影片/剧集关键字或 http(s) 直链；直接回车返回主菜单。")
+                    );
+                    let Some(term) = ask("搜索关键字：")? else {
+                        return Ok(());
+                    };
+                    term
+                }
+            };
+            if term.starts_with("http://") || term.starts_with("https://") {
+                return self
+                    .prepare_download(DIRECT_SERVER.to_string(), crate::direct_item(&term))
+                    .await;
+            }
+
+            let targets = self.search_targets();
+            if targets.is_empty() {
+                println!(
+                    "{} 没有可用的服务器，请先在「服务器管理」中登录",
+                    yellow("!")
+                );
+                return Ok(());
+            }
+            let groups = self.search_groups(&term, &targets).await;
+            if groups.is_empty() {
+                println!("{} 没有匹配结果", yellow("!"));
+                if confirm("重新搜索？", true)? {
+                    continue 'search;
+                }
+                return Ok(());
+            }
+
+            let sources: usize = groups.iter().map(|g| g.hits.len()).sum();
+            println!();
+            println!(
+                "{} 找到 {} 个影片，共 {} 个来源",
+                green("✓"),
+                bold(&groups.len().to_string()),
+                sources
+            );
+
+            'groups: loop {
+                print_groups(&groups);
+                let Some(input) = prompt("选择影片编号（b=重新搜索，回车取消）：")?
+                else {
+                    return Ok(());
+                };
+                let input = input.trim();
+                if input.is_empty() {
+                    return Ok(());
+                }
+                if input == "b" {
+                    continue 'search;
+                }
+                let Ok(index) = input.parse::<usize>() else {
+                    println!("{} 请输入编号", yellow("!"));
+                    continue 'groups;
+                };
+                if index == 0 || index > groups.len() {
+                    println!("{} 编号超出范围", yellow("!"));
+                    continue 'groups;
+                }
+                let group = &groups[index - 1];
+                let options = source_options(group);
+                println!();
+                println!("{} {}", cyan("▸"), bold(&format!("{} 的来源", group.title)));
+                print_sources(&options);
+
+                loop {
+                    let Some(input) =
+                        prompt("选择来源编号（b=返回影片列表，r=重新搜索，回车取消）：")?
+                    else {
+                        return Ok(());
+                    };
+                    let input = input.trim();
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                    if input == "b" {
+                        continue 'groups;
+                    }
+                    if input == "r" {
+                        continue 'search;
+                    }
+                    let Ok(index) = input.parse::<usize>() else {
+                        println!("{} 请输入编号", yellow("!"));
+                        continue;
+                    };
+                    if index == 0 || index > options.len() {
+                        println!("{} 编号超出范围", yellow("!"));
+                        continue;
+                    }
+                    let source = &options[index - 1];
+                    self.prepare_download(source.server.clone(), source.item.clone())
+                        .await?;
+                    if confirm("继续从这次搜索结果中选择？", false)? {
+                        continue 'groups;
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
 
-    /// 搜索并让用户选择影片/来源；下载与秒传测试共用。
-    async fn select_source(&mut self) -> Result<Option<(String, Item)>> {
-        println!(
-            "{}",
-            dim("可输入影片/剧集关键字或 http(s) 直链；直接回车返回主菜单。")
-        );
-        let Some(term) = ask("搜索关键字：")? else {
-            return Ok(None);
-        };
-        if term.starts_with("http://") || term.starts_with("https://") {
-            return Ok(Some((DIRECT_SERVER.to_string(), crate::direct_item(&term))));
-        }
+    /// 并发搜索所有目标服务器；失败的服务器单独提示，不阻塞其他结果。
+    async fn search_groups(&self, term: &str, targets: &[(String, Client)]) -> Vec<TitleGroup> {
+        println!("{} 正在 {} 个服务器搜索 “{term}”…", dim("·"), targets.len());
+        let results = join_all(targets.iter().map(|(name, client)| {
+            let name = name.clone();
+            let client = client.clone();
+            let term = term.to_string();
+            async move {
+                let result = tokio::time::timeout(SEARCH_TIMEOUT, client.search(&term, SEARCH_LIMIT))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("搜索超时")));
+                (name, result)
+            }
+        }))
+        .await;
 
-        let targets = self.search_targets();
-        if targets.is_empty() {
-            println!(
-                "{} 没有可用的服务器，请先在「服务器管理」中登录",
-                yellow("!")
-            );
-            return Ok(None);
-        }
-        println!(
-            "{} 正在 {} 个服务器搜索 “{term}”…",
-            dim("·"),
-            targets.len()
-        );
         let mut hits = Vec::new();
-        let mut errors = Vec::new();
-        for (name, client) in &targets {
-            match client.search(&term, SEARCH_LIMIT).await {
+        for (name, result) in results {
+            match result {
                 Ok(items) => hits.extend(items.into_iter().map(|item| Hit {
                     server: name.clone(),
                     item,
                 })),
-                Err(e) => errors.push(format!("{name}: {e:#}")),
+                Err(e) => println!(
+                    "{} {name}: {}",
+                    yellow("!"),
+                    crate::emby::redact_text(&format!("{e:#}"))
+                ),
             }
         }
-        for error in &errors {
-            println!("{} {error}", yellow("!"));
-        }
-        if hits.is_empty() {
-            println!("{} 没有匹配结果", yellow("!"));
-            return Ok(None);
-        }
-
-        let groups = group_hits(hits, &term);
-        let sources: usize = groups.iter().map(|g| g.hits.len()).sum();
-        println!();
-        println!(
-            "{} 找到 {} 个影片，共 {} 个来源",
-            green("✓"),
-            bold(&groups.len().to_string()),
-            sources
-        );
-        print_groups(&groups);
-        let Some(idx) = choose(groups.len(), "选择影片编号（回车取消）：")? else {
-            return Ok(None);
-        };
-        let group = &groups[idx];
-        let options = source_options(group);
-        println!();
-        println!("{} {}", cyan("▸"), bold(&format!("{} 的来源", group.title)));
-        print_sources(&options);
-        let Some(sidx) = choose(options.len(), "选择来源编号（回车取消）：")? else {
-            return Ok(None);
-        };
-        let source = &options[sidx];
-        Ok(Some((source.server.clone(), source.item.clone())))
+        group_hits(hits, term)
     }
 
-    async fn instant_test_menu(&mut self) -> Result<()> {
-        print_section("秒传测试");
-        println!(
-            "{}",
-            dim("只下载第一集并移动到最终文件夹，通过 CD2 上传任务判断是否秒传。")
-        );
-        if self.cfg.settings.final_dir.trim().is_empty() {
-            println!(
-                "{} 请先在「下载设置」中设置最终文件夹",
-                yellow("!")
-            );
-            return Ok(());
-        }
-        let Some((server, item)) = self.select_source().await? else {
-            return Ok(());
-        };
-        let client = if server == DIRECT_SERVER {
-            Client::new("http://127.0.0.1", false).context("构建直链下载客户端失败")?
-        } else {
-            self.clients
-                .get(&server)
-                .cloned()
-                .with_context(|| format!("服务器 {server} 未连接"))?
-        };
-
-        let cd2 = crate::cd2::Config::resolve(
-            None,
-            None,
-            &self.cfg.settings.cd2_url,
-            &self.cfg.settings.cd2_token,
-        );
-        println!();
-        print_key_value("服务器", &server);
-        print_key_value("CD2 API", &cd2.url);
-        if cd2.token.is_none() {
-            println!(
-                "  {}",
-                dim("未设置 CD2 令牌；可在「下载设置」中填写，或设置 CLOUDDRIVE_API_TOKEN。")
-            );
-        }
-        if !confirm("开始秒传测试？", true)? {
-            println!("{} 已取消", yellow("!"));
-            return Ok(());
-        }
-        let keep = confirm("测试后保留最终文件夹中的测试目录？", false)?;
-        let options = crate::instant::Options {
-            cd2_url: None,
-            cd2_token: None,
-            window: Duration::from_secs(20),
-            keep,
-            temp_dir: None,
-            final_dir: None,
-        };
-        crate::instant::run_item(server, client, item, &self.cfg.settings, options).await
-    }
-
-    fn search_targets(&self) -> Vec<(String, Client)> {        match &self.scope {
+    fn search_targets(&self) -> Vec<(String, Client)> {
+        match &self.scope {
             Some(name) => match self.clients.get(name) {
                 Some(client) => vec![(name.clone(), client.clone())],
                 None => {
-                    println!("{} 搜索范围 {name} 当前未连接，已改为搜索全部服务器", yellow("!"));
+                    println!(
+                        "{} 搜索范围 {name} 当前未连接，已改为搜索全部服务器",
+                        yellow("!")
+                    );
                     self.clients
                         .iter()
                         .map(|(n, c)| (n.clone(), c.clone()))
@@ -514,7 +608,11 @@ impl App {
                             Ok(children) => {
                                 stack.push((Some(item.clone()), item.title(), children));
                             }
-                            Err(e) => println!("加载失败：{e:#}"),
+                            Err(e) => println!(
+                                "{} 加载失败：{}",
+                                red("✗"),
+                                crate::emby::redact_text(&format!("{e:#}"))
+                            ),
                         }
                     } else {
                         self.prepare_download(server.clone(), item).await?;
@@ -529,25 +627,32 @@ impl App {
     async fn queue_menu(&mut self) -> Result<()> {
         // 给后台连接任务一点时间拿到第一份快照。
         tokio::time::sleep(Duration::from_millis(300)).await;
-        print_section("下载队列");
+        let mut notice: Option<String> = None;
         loop {
-            self.print_queue();
-            println!();
+            let pending = self.watch_queue(notice.take().as_deref())?;
             print_options(&[
-                ("r)", "刷新"),
-                ("p)", "暂停/继续"),
+                ("p)", "暂停/继续服务器"),
                 ("P)", "全部暂停/继续"),
+                ("c)", "取消单个任务"),
                 ("x)", "取消服务器队列"),
                 ("X)", "取消全部"),
-                ("c)", "清空完成记录"),
+                ("R)", "重试失败任务"),
+                ("e)", "查看失败详情"),
+                ("C)", "清空完成记录"),
                 ("u)", "未完成任务找回"),
+                ("r)", "立即刷新"),
                 ("0)", "返回"),
             ]);
-            let Some(choice) = prompt("请选择：")? else {
-                return Ok(());
+            let choice = match pending {
+                Some(line) if !line.is_empty() => line,
+                Some(_) => match prompt("请选择（回车返回）：")? {
+                    Some(choice) => choice,
+                    None => return Ok(()),
+                },
+                None => return Ok(()),
             };
             match choice.as_str() {
-                "r" | "" => {}
+                "r" => {}
                 "p" => {
                     let Some(server) = self.choose_queue_server("暂停/继续哪个服务器 [1-N]：")?
                     else {
@@ -561,57 +666,234 @@ impl App {
                             .map(|s| s.paused)
                             .unwrap_or(false)
                     };
-                    if paused {
-                        self.daemon.resume_server(&server);
-                        println!("{} 已继续 {server}", green("✓"));
+                    let result = if paused {
+                        self.daemon.resume_server(&server).await
                     } else {
-                        self.daemon.pause_server(&server);
-                        println!("{} 已暂停 {server}", yellow("!"));
-                    }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                        self.daemon.pause_server(&server).await
+                    };
+                    notice = match result {
+                        Ok(()) if paused => Some(format!("{} 已继续 {server}", green("✓"))),
+                        Ok(()) => Some(format!("{} 已暂停 {server}", yellow("!"))),
+                        Err(e) => Some(format!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        )),
+                    };
                 }
                 "P" => {
                     let all_paused = {
                         let state = self.daemon.state();
                         !state.servers.is_empty() && state.servers.values().all(|s| s.paused)
                     };
-                    if all_paused {
-                        self.daemon.resume_all();
-                        println!("{} 已继续所有服务器的下载", green("✓"));
+                    let result = if all_paused {
+                        self.daemon.resume_all().await
                     } else {
-                        self.daemon.pause_all();
-                        println!("{} 已暂停所有服务器的下载", yellow("!"));
+                        self.daemon.pause_all().await
+                    };
+                    notice = match result {
+                        Ok(()) if all_paused => {
+                            Some(format!("{} 已继续所有服务器的下载", green("✓")))
+                        }
+                        Ok(()) => Some(format!("{} 已暂停所有服务器的下载", yellow("!"))),
+                        Err(e) => Some(format!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        )),
+                    };
+                }
+                "c" => {
+                    let tasks = {
+                        let state = self.daemon.state();
+                        task_refs(&state)
+                    };
+                    if tasks.is_empty() {
+                        notice = Some(format!("{} 没有可取消的任务", yellow("!")));
+                        continue;
                     }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let Some(index) = choose(tasks.len(), "取消任务编号 [1-N]（回车取消）：")?
+                    else {
+                        continue;
+                    };
+                    let task = &tasks[index];
+                    let label = if task.active {
+                        "正在下载的任务"
+                    } else {
+                        "排队任务"
+                    };
+                    if !confirm(&format!("取消{label}「{}」？", task.title), false)? {
+                        continue;
+                    }
+                    notice = match self.daemon.cancel_job(&task.server, task.id).await {
+                        Ok(()) => Some(format!("{} 已取消「{}」", green("✓"), task.title)),
+                        Err(e) => Some(format!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        )),
+                    };
                 }
                 "x" => {
                     let Some(server) = self.choose_queue_server("取消哪个服务器的队列 [1-N]：")?
                     else {
                         continue;
                     };
-                    self.daemon.cancel_server(&server);
-                    println!("{} 已取消 {server} 的队列", green("✓"));
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if !confirm(
+                        &format!("取消 {server} 的队列？正在下载的任务也会停止"),
+                        false,
+                    )? {
+                        continue;
+                    }
+                    notice = match self.daemon.cancel_server(&server).await {
+                        Ok(()) => Some(format!("{} 已取消 {server} 的队列", green("✓"))),
+                        Err(e) => Some(format!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        )),
+                    };
                 }
                 "X" => {
-                    if confirm("取消所有服务器的下载队列？", false)? {
-                        self.daemon.cancel_all();
-                        println!("{} 已取消所有服务器的下载", green("✓"));
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    if confirm("取消所有服务器的下载队列？正在下载的任务也会停止", false)?
+                    {
+                        notice = match self.daemon.cancel_all().await {
+                            Ok(()) => Some(format!("{} 已取消所有服务器的下载", green("✓"))),
+                            Err(e) => Some(format!(
+                                "{} {}",
+                                red("✗"),
+                                crate::emby::redact_text(&format!("{e:#}"))
+                            )),
+                        };
                     }
                 }
-                "c" => {
+                "R" => {
+                    let retries = {
+                        let state = self.daemon.state();
+                        retry_refs(&state)
+                    };
+                    if retries.is_empty() {
+                        notice = Some(format!("{} 没有可重试的失败任务", yellow("!")));
+                        continue;
+                    }
+                    let Some(index) = choose(retries.len(), "重试任务编号 [1-N]（回车取消）：")?
+                    else {
+                        continue;
+                    };
+                    let retry = &retries[index];
+                    if !confirm(&format!("重试「{}」？", retry.title), true)? {
+                        continue;
+                    }
+                    notice = match self.daemon.retry_job(&retry.server, retry.id).await {
+                        Ok(()) => Some(format!("{} 已重新加入「{}」", green("✓"), retry.title)),
+                        Err(e) => Some(format!(
+                            "{} {}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        )),
+                    };
+                }
+                "e" => self.show_failures()?,
+                "C" => {
                     if confirm("清空最近完成记录并删除历史文件？", false)? {
-                        self.daemon.clear_finished();
-                        println!("{} 已清空下载记录", green("✓"));
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        notice = match self.daemon.clear_finished().await {
+                            Ok(()) => Some(format!("{} 已清空下载记录", green("✓"))),
+                            Err(e) => Some(format!(
+                                "{} {}",
+                                red("✗"),
+                                crate::emby::redact_text(&format!("{e:#}"))
+                            )),
+                        };
                     }
                 }
                 "u" => self.unfinished_menu().await?,
-                "0" | "q" => return Ok(()),
-                _ => println!("无效选择"),
+                "0" | "q" | "" => return Ok(()),
+                _ => notice = Some(format!("{} 无效选择", yellow("!"))),
             }
         }
+    }
+
+    /// 实时刷新队列，直到有输入。
+    ///
+    /// 返回 `None` 表示 stdin 已关闭；返回空字符串表示用户只按了 Enter，
+    /// 此时调用方应显示操作菜单并继续提示输入。
+    fn watch_queue(&self, notice: Option<&str>) -> Result<Option<String>> {
+        let terminal = io::stdout().is_terminal()
+            && std::env::var("TERM")
+                .map(|term| term != "dumb")
+                .unwrap_or(true);
+        loop {
+            if terminal {
+                clear_screen();
+            }
+            print_section("下载队列");
+            if let Some(notice) = notice {
+                println!("  {notice}");
+            }
+            self.print_queue();
+            println!();
+            println!(
+                "  {}",
+                dim(if terminal {
+                    "实时刷新中；按 Enter 进入操作。"
+                } else {
+                    "按 Enter 进入操作。"
+                })
+            );
+            if !terminal {
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line).context("读取输入失败")? == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(line.trim().to_string()));
+            }
+            if stdin_ready(Duration::from_secs(1))? {
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line).context("读取输入失败")? == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(line.trim().to_string()));
+            }
+        }
+    }
+
+    fn show_failures(&self) -> Result<()> {
+        let failures: Vec<Finished> = {
+            let state = self.daemon.state();
+            state
+                .finished
+                .iter()
+                .filter(|done| done.status == FinishedStatus::Failed)
+                .cloned()
+                .collect()
+        };
+        if failures.is_empty() {
+            println!("{} 没有失败任务", yellow("!"));
+            prompt("按 Enter 返回：")?;
+            return Ok(());
+        }
+        print_section("失败详情");
+        let mut table = Table::new(&["#", "服务器", "名称"]).align(0, Align::Right);
+        for (i, failure) in failures.iter().enumerate() {
+            table.row(vec![
+                (i + 1).to_string(),
+                failure.server.clone(),
+                failure.title.clone(),
+            ]);
+        }
+        println!("{}", table.render());
+        let Some(index) = choose(failures.len(), "查看第几条（回车返回）：")? else {
+            return Ok(());
+        };
+        let failure = &failures[index];
+        println!();
+        println!("{}  {}", bold(&failure.title), dim(&failure.server));
+        match &failure.error {
+            Some(error) => println!("{error}"),
+            None => println!("{}", dim("（没有错误信息）")),
+        }
+        prompt("按 Enter 返回：")?;
+        Ok(())
     }
 
     fn print_queue(&self) {
@@ -623,7 +905,14 @@ impl App {
 
         if !state.servers.is_empty() {
             let mut table = Table::new(&[
-                "服务器", "状态", "运行", "排队", "完成", "失败", "跳过", "取消",
+                "服务器",
+                "状态",
+                "运行",
+                "排队",
+                "完成",
+                "失败",
+                "跳过",
+                "取消",
             ])
             .align(2, Align::Right)
             .align(3, Align::Right)
@@ -634,7 +923,12 @@ impl App {
             for (name, server) in &state.servers {
                 table.row(vec![
                     name.clone(),
-                    if server.paused { "已暂停" } else { "运行中" }.to_string(),
+                    if server.paused {
+                        "已暂停"
+                    } else {
+                        "运行中"
+                    }
+                    .to_string(),
                     server.active.len().to_string(),
                     server.queue.len().to_string(),
                     server.done.to_string(),
@@ -646,66 +940,88 @@ impl App {
             println!("{}", table.render());
         }
 
-        let active: Vec<(String, String, String, String, String)> = state
-            .servers
+        let tasks = task_refs(&state);
+        let active: Vec<(usize, &TaskRef, &crate::manager::ActiveView)> = tasks
             .iter()
-            .flat_map(|(name, server)| {
-                server.active.iter().map(move |job| {
-                    let pct = if job.length > 0 {
-                        job.position as f64 / job.length as f64 * 100.0
-                    } else {
-                        0.0
-                    };
-                    (
-                        name.clone(),
-                        format!("{pct:.1}%"),
-                        format_bytes(job.position),
-                        format_bytes(job.length),
-                        job.title.clone(),
-                    )
-                })
+            .enumerate()
+            .filter(|(_, task)| task.active)
+            .filter_map(|(index, task)| {
+                let view = state
+                    .servers
+                    .get(&task.server)?
+                    .active
+                    .iter()
+                    .find(|job| job.id == task.id)?;
+                Some((index + 1, task, view))
             })
             .collect();
         if !active.is_empty() {
             println!();
             println!("{}", bold("正在下载"));
-            let mut table = Table::new(&["服务器", "进度", "已下载", "总大小", "名称"])
-                .align(1, Align::Right)
+            let mut table = Table::new(&["#", "服务器", "进度", "已下载", "总大小", "名称"])
+                .align(0, Align::Right)
                 .align(2, Align::Right)
-                .align(3, Align::Right);
-            for (server, pct, position, length, title) in active {
-                table.row(vec![server, pct, position, length, title]);
+                .align(3, Align::Right)
+                .align(4, Align::Right);
+            for (number, task, job) in active {
+                let pct = if job.length > 0 {
+                    job.position as f64 / job.length as f64 * 100.0
+                } else {
+                    0.0
+                };
+                table.row(vec![
+                    number.to_string(),
+                    task.server.clone(),
+                    format!("{pct:.1}%"),
+                    format_bytes(job.position),
+                    format_bytes(job.length),
+                    job.title.clone(),
+                ]);
             }
             println!("{}", table.render());
         }
 
-        let queued: Vec<(String, String)> = state
-            .servers
+        let queued: Vec<(usize, &TaskRef)> = tasks
             .iter()
-            .flat_map(|(name, server)| {
-                server
-                    .queue
-                    .iter()
-                    .map(move |job| (name.clone(), job.title.clone()))
-            })
+            .enumerate()
+            .filter(|(_, task)| !task.active)
+            .map(|(index, task)| (index + 1, task))
             .collect();
-        if !queued.is_empty() {
+        let rows = queue_rows(&state, &tasks);
+        if !rows.is_empty() {
             println!();
             println!("{}", bold("排队任务"));
-            let mut table = Table::new(&["服务器", "名称"]);
-            for (server, title) in queued.iter().take(QUEUE_PREVIEW) {
-                table.row(vec![server.clone(), title.clone()]);
+            let mut table = Table::new(&["#", "服务器", "名称"]).align(0, Align::Right);
+            let mut shown_tasks = 0usize;
+            for row in rows.iter().take(QUEUE_PREVIEW) {
+                shown_tasks += row.numbers.len();
+                table.row(vec![row.number_label(), row.server.clone(), row.label()]);
             }
             println!("{}", table.render());
-            if queued.len() > QUEUE_PREVIEW {
+            let hidden = queued.len().saturating_sub(shown_tasks);
+            if hidden > 0 {
                 println!(
                     "  {}",
                     dim(&format!(
-                        "… 还有 {} 个排队任务（只显示前 {QUEUE_PREVIEW} 个）",
-                        queued.len() - QUEUE_PREVIEW
+                        "… 还有 {hidden} 个排队任务（只显示前 {QUEUE_PREVIEW} 组）"
                     ))
                 );
             }
+        }
+
+        let retries = retry_refs(&state);
+        if !retries.is_empty() {
+            println!();
+            println!("{}", bold("可重试的失败任务"));
+            let mut table = Table::new(&["#", "服务器", "名称"]).align(0, Align::Right);
+            for (i, retry) in retries.iter().enumerate() {
+                table.row(vec![
+                    (i + 1).to_string(),
+                    retry.server.clone(),
+                    retry.title.clone(),
+                ]);
+            }
+            println!("{}", table.render());
         }
 
         if !state.finished.is_empty() {
@@ -724,11 +1040,7 @@ impl App {
                     && let Some(error) = &done.error
                 {
                     let error = error.lines().next().unwrap_or(error);
-                    failures.push(format!(
-                        "{}：{}",
-                        done.title,
-                        truncate_display(error, 60)
-                    ));
+                    failures.push(format!("{}：{}", done.title, truncate_display(error, 60)));
                 }
                 table.row(vec![
                     status.to_string(),
@@ -738,7 +1050,7 @@ impl App {
             }
             println!("{}", table.render());
             if !failures.is_empty() {
-                println!("  {}", dim("失败原因："));
+                println!("  {}", dim("失败原因（e) 查看完整信息）："));
                 for failure in failures.iter().take(3) {
                     println!("    {} {failure}", dim("↳"));
                 }
@@ -765,8 +1077,8 @@ impl App {
             if self.cfg.servers.is_empty() {
                 println!("  {}", dim("（尚未登录）"));
             } else {
-                let mut table = Table::new(&["#", "名称", "地址", "状态", "搜索范围"])
-                    .align(0, Align::Right);
+                let mut table =
+                    Table::new(&["#", "名称", "地址", "状态", "搜索范围"]).align(0, Align::Right);
                 for (i, (name, profile)) in self.cfg.servers.iter().enumerate() {
                     let connected = if self.clients.contains_key(name) {
                         "已连接"
@@ -809,23 +1121,26 @@ impl App {
                     }
                 }
                 "d" => {
-                    let Some(name) = ask("要删除的服务器名称（回车取消）：")? else {
+                    let names: Vec<String> = self.cfg.servers.keys().cloned().collect();
+                    let Some(name) = choose_name(&names, "选择要删除的服务器 [1-N]（回车取消）：")?
+                    else {
                         continue;
                     };
-                    if !self.cfg.servers.contains_key(&name) {
-                        println!("{} 没有名为 {name} 的服务器", yellow("!"));
-                        continue;
-                    }
                     if !confirm(&format!("删除 {name} 的登录信息？"), false)? {
                         continue;
                     }
                     match crate::logout(Some(name)) {
                         Ok(()) => self.reload_config().await,
-                        Err(e) => println!("{} 删除失败：{e:#}", red("✗")),
+                        Err(e) => println!(
+                            "{} 删除失败：{}",
+                            red("✗"),
+                            crate::emby::redact_text(&format!("{e:#}"))
+                        ),
                     }
                 }
                 "s" => {
-                    let Some(value) = prompt("搜索范围（服务器名称，留空=全部服务器）：")? else {
+                    let Some(value) = prompt("搜索范围（服务器名称，留空=全部服务器）：")?
+                    else {
                         continue;
                     };
                     if value.is_empty() {
@@ -851,36 +1166,44 @@ impl App {
             return Ok(false);
         };
         let name = prompt("服务器别名（可留空）：")?.unwrap_or_default();
-        print_options(&[("1)", "API Key"), ("2)", "账号密码")]);
-        let mode = prompt("登录方式 [1/2，默认 2]：")?.unwrap_or_default();
-        let (user, password, api_key) = if mode.trim() == "1" {
-            let Some(key) = ask("API Key（回车取消）：")? else {
-                return Ok(false);
-            };
-            (None, None, Some(key))
-        } else {
-            let Some(user) = ask("用户名（回车取消）：")? else {
-                return Ok(false);
-            };
-            let Some(password) = read_secret("密码（回车取消）：")? else {
-                return Ok(false);
-            };
-            (Some(user), Some(password), None)
-        };
         let insecure = confirm("跳过 TLS 证书校验（自签名服务器）？", false)?;
-        let args = LoginArgs {
-            server,
-            name: (!name.trim().is_empty()).then_some(name),
-            user,
-            password,
-            api_key,
-            insecure,
-        };
-        match crate::login(args).await {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                println!("登录失败：{e:#}");
-                Ok(false)
+        loop {
+            print_options(&[("1)", "API Key"), ("2)", "账号密码")]);
+            let mode = prompt("登录方式 [1/2，默认 2]：")?.unwrap_or_default();
+            let (user, password, api_key) = if mode.trim() == "1" {
+                let Some(key) = read_secret("API Key（回车取消）：")? else {
+                    return Ok(false);
+                };
+                (None, None, Some(key))
+            } else {
+                let Some(user) = ask("用户名（回车取消）：")? else {
+                    return Ok(false);
+                };
+                let Some(password) = read_secret("密码（回车取消）：")? else {
+                    return Ok(false);
+                };
+                (Some(user), Some(password), None)
+            };
+            let args = LoginArgs {
+                server: server.clone(),
+                name: (!name.trim().is_empty()).then(|| name.clone()),
+                user,
+                password,
+                api_key,
+                insecure,
+            };
+            match crate::login(args).await {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    println!(
+                        "{} 登录失败：{}",
+                        red("✗"),
+                        crate::emby::redact_text(&format!("{e:#}"))
+                    );
+                    if !confirm("重试登录？", true)? {
+                        return Ok(false);
+                    }
+                }
             }
         }
     }
@@ -911,16 +1234,6 @@ impl App {
             } else {
                 truncate_display(s.pattern.trim(), 48)
             };
-            let cd2_url = if s.cd2_url.trim().is_empty() {
-                "默认（http://127.0.0.1:19798）".to_string()
-            } else {
-                truncate_display(s.cd2_url.trim(), 48)
-            };
-            let cd2_token = if s.cd2_token.trim().is_empty() {
-                "未设置".to_string()
-            } else {
-                "已设置".to_string()
-            };
             let rows = [
                 ("1", "临时文件夹（下载目录）", temp.to_string()),
                 ("2", "最终文件夹（同步目标）", final_dir.to_string()),
@@ -931,18 +1244,13 @@ impl App {
                 ("7", "覆盖已存在文件", on_off(s.overwrite).to_string()),
                 ("8", "断点续传", on_off(s.resume).to_string()),
                 ("9", "命名模板", pattern),
-                ("10", "CD2 地址（秒传测试）", cd2_url),
-                ("11", "CD2 API 令牌", cd2_token),
             ];
             let mut table = Table::new(&["#", "设置项", "当前值"]).align(0, Align::Right);
             for (key, name, value) in rows {
                 table.row(vec![key.to_string(), name.to_string(), value]);
             }
             println!("{}", table.render());
-            println!(
-                "  {}",
-                dim("修改后立即保存。CD2 参数优先级：命令行/环境变量 > 此处设置 > 默认。")
-            );
+            println!("  {}", dim("修改后立即保存。"));
             print_options(&[("0)", "返回")]);
 
             let Some(choice) = prompt("选择要修改的项：")? else {
@@ -957,14 +1265,24 @@ impl App {
                     }
                 }
                 "2" => {
-                    if let Some(value) = prompt("新的最终文件夹（同步目标；回车取消）：")?
+                    if let Some(value) =
+                        prompt("新的最终文件夹（同步目标；输入 - 清除；回车取消）：")?
                     {
-                        self.update_settings(|s| s.final_dir = value.trim().to_string());
+                        let value = value.trim();
+                        if value == "-" {
+                            self.update_settings(|s| s.final_dir.clear());
+                        } else if !value.is_empty() {
+                            self.update_settings(|s| s.final_dir = value.to_string());
+                        }
                     }
                 }
                 "3" => {
                     if let Some(value) = prompt("每文件连接数 1-32（回车取消）：")? {
-                        match value.trim().parse::<usize>() {
+                        let value = value.trim();
+                        if value.is_empty() {
+                            continue;
+                        }
+                        match value.parse::<usize>() {
                             Ok(n) => self.update_settings(|s| s.connections = n.clamp(1, 32)),
                             Err(_) => println!("请输入数字"),
                         }
@@ -972,7 +1290,11 @@ impl App {
                 }
                 "4" => {
                     if let Some(value) = prompt("每服务器并发数 1-8（回车取消）：")? {
-                        match value.trim().parse::<usize>() {
+                        let value = value.trim();
+                        if value.is_empty() {
+                            continue;
+                        }
+                        match value.parse::<usize>() {
                             Ok(n) => self.update_settings(|s| s.jobs = n.clamp(1, 8)),
                             Err(_) => println!("请输入数字"),
                         }
@@ -980,11 +1302,13 @@ impl App {
                 }
                 "5" => {
                     if let Some(value) =
-                        prompt("新的限速（如 5M / 800K；留空=不限速；回车取消）：")?
+                        prompt("新的限速（如 5M / 800K；输入 - 清除限速；回车取消）：")?
                     {
                         let value = value.trim();
-                        if value.is_empty() {
+                        if value == "-" {
                             self.update_settings(|s| s.limit.clear());
+                        } else if value.is_empty() {
+                            // 回车取消，不做修改。
                         } else if parse_rate(value).is_some() {
                             self.update_settings(|s| s.limit = value.to_string());
                         } else {
@@ -996,32 +1320,14 @@ impl App {
                 "7" => self.update_settings(|s| s.overwrite = !s.overwrite),
                 "8" => self.update_settings(|s| s.resume = !s.resume),
                 "9" => {
-                    if let Some(value) = prompt("新的命名模板（留空=内置默认；回车取消）：")?
-                    {
-                        self.update_settings(|s| s.pattern = value);
-                    }
-                }
-                "10" => {
                     if let Some(value) =
-                        prompt("新的 CD2 地址（输入 - 恢复默认，回车取消）：")?
+                        prompt("新的命名模板（输入 - 恢复内置默认；回车取消）：")?
                     {
                         let value = value.trim();
                         if value == "-" {
-                            self.update_settings(|s| s.cd2_url.clear());
+                            self.update_settings(|s| s.pattern.clear());
                         } else if !value.is_empty() {
-                            self.update_settings(|s| s.cd2_url = value.to_string());
-                        }
-                    }
-                }
-                "11" => {
-                    if let Some(value) =
-                        read_secret("新的 CD2 API 令牌（输入 - 清除，回车取消）：")?
-                    {
-                        let value = value.trim();
-                        if value == "-" {
-                            self.update_settings(|s| s.cd2_token.clear());
-                        } else if !value.is_empty() {
-                            self.update_settings(|s| s.cd2_token = value.to_string());
+                            self.update_settings(|s| s.pattern = value.to_string());
                         }
                     }
                 }
@@ -1043,7 +1349,11 @@ impl App {
                 self.cfg.settings = settings;
                 println!("{} 已保存", green("✓"));
             }
-            Err(e) => println!("{} 保存设置失败：{e:#}", red("✗")),
+            Err(e) => println!(
+                "{} 保存设置失败：{}",
+                red("✗"),
+                crate::emby::redact_text(&format!("{e:#}"))
+            ),
         }
     }
 
@@ -1208,6 +1518,173 @@ impl App {
         let names: Vec<String> = self.clients.keys().cloned().collect();
         choose_name(&names, hint)
     }
+}
+
+// ───────────────────────── 队列任务索引 ─────────────────────────
+
+/// 队列里可操作的任务；`active` 表示正在下载。
+#[derive(Clone)]
+struct TaskRef {
+    server: String,
+    id: u64,
+    title: String,
+    active: bool,
+}
+
+#[derive(Clone)]
+struct RetryRef {
+    server: String,
+    id: u64,
+    title: String,
+}
+
+/// 与队列界面编号一致：先列所有运行中的任务，再列排队任务。
+fn task_refs(state: &Snapshot) -> Vec<TaskRef> {
+    let mut refs = Vec::new();
+    for (server, view) in &state.servers {
+        for job in &view.active {
+            refs.push(TaskRef {
+                server: server.clone(),
+                id: job.id,
+                title: job.title.clone(),
+                active: true,
+            });
+        }
+    }
+    for (server, view) in &state.servers {
+        for job in &view.queue {
+            refs.push(TaskRef {
+                server: server.clone(),
+                id: job.id,
+                title: job.title.clone(),
+                active: false,
+            });
+        }
+    }
+    refs
+}
+
+fn retry_refs(state: &Snapshot) -> Vec<RetryRef> {
+    let mut refs = Vec::new();
+    for (server, view) in &state.servers {
+        for job in &view.retryable {
+            refs.push(RetryRef {
+                server: server.clone(),
+                id: job.id,
+                title: job.title.clone(),
+            });
+        }
+    }
+    refs
+}
+
+/// 排队任务的一行：同一服务器的同一季剧集聚合成一行。
+struct QueueRow {
+    /// 组内任务在 `task_refs` 中的全局编号（从 1 开始）。
+    numbers: Vec<usize>,
+    server: String,
+    series: Option<String>,
+    season: Option<i32>,
+    episode: Option<i32>,
+    title: String,
+}
+
+impl QueueRow {
+    fn label(&self) -> String {
+        match (&self.series, self.season) {
+            (Some(series), Some(season)) if self.numbers.len() > 1 => {
+                format!("{series} S{season:02}（{} 集）", self.numbers.len())
+            }
+            (Some(series), Some(season)) => match self.episode {
+                Some(episode) => {
+                    format!("{series} S{season:02}E{episode:02} · {}", self.title)
+                }
+                None => format!("{series} S{season:02} · {}", self.title),
+            },
+            _ => self.title.clone(),
+        }
+    }
+
+    fn number_label(&self) -> String {
+        format_number_ranges(&self.numbers)
+    }
+}
+
+/// 把连续编号压缩成 `1-3,5` 的形式。
+fn format_number_ranges(numbers: &[usize]) -> String {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut previous = 0;
+    for &number in numbers {
+        match start {
+            None => {
+                start = Some(number);
+                previous = number;
+            }
+            Some(_) if number == previous + 1 => previous = number,
+            Some(begin) => {
+                parts.push(if begin == previous {
+                    begin.to_string()
+                } else {
+                    format!("{begin}-{previous}")
+                });
+                start = Some(number);
+                previous = number;
+            }
+        }
+    }
+    if let Some(begin) = start {
+        parts.push(if begin == previous {
+            begin.to_string()
+        } else {
+            format!("{begin}-{previous}")
+        });
+    }
+    parts.join(",")
+}
+
+/// 按「服务器 + 剧名 + 季」聚合排队任务；电影/无法识别的条目保持逐条显示。
+fn queue_rows(state: &Snapshot, tasks: &[TaskRef]) -> Vec<QueueRow> {
+    let mut rows: Vec<QueueRow> = Vec::new();
+    let mut groups: HashMap<(String, String, i32), usize> = HashMap::new();
+    for (position, task) in tasks.iter().enumerate() {
+        if task.active {
+            continue;
+        }
+        let view = state
+            .servers
+            .get(&task.server)
+            .and_then(|server| server.queue.iter().find(|job| job.id == task.id));
+        let Some(view) = view else {
+            continue;
+        };
+        if let (Some(series), Some(season)) = (&view.series, view.season) {
+            let key = (task.server.clone(), series.clone(), season);
+            if let Some(&row) = groups.get(&key) {
+                rows[row].numbers.push(position + 1);
+            } else {
+                groups.insert(key, rows.len());
+                rows.push(QueueRow {
+                    numbers: vec![position + 1],
+                    server: task.server.clone(),
+                    series: Some(series.clone()),
+                    season: Some(season),
+                    episode: view.episode,
+                    title: task.title.clone(),
+                });
+            }
+        } else {
+            rows.push(QueueRow {
+                numbers: vec![position + 1],
+                server: task.server.clone(),
+                series: None,
+                season: None,
+                episode: None,
+                title: task.title.clone(),
+            });
+        }
+    }
+    rows
 }
 
 // ───────────────────────── 搜索结果聚合 ─────────────────────────
@@ -1497,7 +1974,10 @@ fn choose_versions(files: Vec<Item>) -> Result<Option<Vec<Item>>> {
                 let label = versions[n - 1].label.clone();
                 let (kept, skipped) = filter_to_version(files, &label);
                 if skipped > 0 {
-                    println!("ℹ️  版本 “{label}”：跳过 {skipped} 个不含该版本的条目");
+                    println!(
+                        "{} 版本 “{label}”：跳过 {skipped} 个不含该版本的条目",
+                        dim("·")
+                    );
                 }
                 return Ok(Some(kept));
             }
@@ -1601,8 +2081,98 @@ where
     F: std::future::Future<Output = Result<()>>,
 {
     if let Err(e) = future.await {
-        println!("❌ {e:#}");
+        println!(
+            "{} {}",
+            red("✗"),
+            crate::emby::redact_text(&format!("{e:#}"))
+        );
     }
+}
+
+/// 输入历史编辑器：十字键/上下键可用，历史写入配置目录。
+static EDITOR: OnceLock<Mutex<DefaultEditor>> = OnceLock::new();
+
+fn editor() -> Option<&'static Mutex<DefaultEditor>> {
+    if let Some(editor) = EDITOR.get() {
+        return Some(editor);
+    }
+    let config = EditorConfig::builder().auto_add_history(true).build();
+    let mut editor = DefaultEditor::with_config(config).ok()?;
+    if let Some(path) = editor_history_path() {
+        let _ = editor.load_history(&path);
+    }
+    let _ = EDITOR.set(Mutex::new(editor));
+    EDITOR.get()
+}
+
+fn editor_history_path() -> Option<PathBuf> {
+    config::dir().ok().map(|dir| dir.join("input_history.txt"))
+}
+
+fn save_editor_history() {
+    let Some(editor) = EDITOR.get() else {
+        return;
+    };
+    let Some(path) = editor_history_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut editor = editor.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = editor.save_history(&path);
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// 清屏并回到左上角；只在终端中生效。
+fn clear_screen() {
+    if io::stdout().is_terminal() {
+        print!("\x1b[2J\x1b[H");
+        let _ = io::stdout().flush();
+    }
+}
+
+/// 等待 stdin 有输入（最多 `timeout`），用于实时刷新队列。
+#[cfg(target_os = "linux")]
+fn stdin_ready(timeout: Duration) -> Result<bool> {
+    #[repr(C)]
+    struct PollFd {
+        fd: std::os::raw::c_int,
+        events: std::os::raw::c_short,
+        revents: std::os::raw::c_short,
+    }
+    const POLLIN: std::os::raw::c_short = 0x0001;
+    unsafe extern "C" {
+        fn poll(
+            fds: *mut PollFd,
+            nfds: std::os::raw::c_ulong,
+            timeout: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    let mut fds = PollFd {
+        fd: 0,
+        events: POLLIN,
+        revents: 0,
+    };
+    loop {
+        let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY：`fds` 指向单个可写的 PollFd，nfds=1。
+        let rc = unsafe { poll(&mut fds, 1, millis) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("等待输入失败");
+        }
+        return Ok(rc > 0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stdin_ready(_timeout: Duration) -> Result<bool> {
+    Ok(true)
 }
 
 fn build_opts(settings: &Settings) -> Result<DownloadOpts> {
@@ -1669,6 +2239,29 @@ fn choose(len: usize, hint: &str) -> Result<Option<usize>> {
 }
 
 fn prompt(hint: &str) -> Result<Option<String>> {
+    let Some(editor) = editor() else {
+        return prompt_plain(hint);
+    };
+    let result = {
+        let mut editor = editor.lock().unwrap_or_else(|e| e.into_inner());
+        let styled = dim(hint);
+        editor.readline(&(hint, styled.as_str()))
+    };
+    match result {
+        Ok(line) => Ok(Some(line.trim().to_string())),
+        Err(ReadlineError::Interrupted) => {
+            save_editor_history();
+            println!();
+            // 与直接使用 read_line 时一致：Ctrl+C 退出交互模式，后台继续下载。
+            std::process::exit(130);
+        }
+        Err(ReadlineError::Eof) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("读取输入失败: {e}")),
+    }
+}
+
+/// 编辑器不可用时的降级实现（非终端/初始化失败）。
+fn prompt_plain(hint: &str) -> Result<Option<String>> {
     print!("{}", dim(hint));
     io::stdout().flush().context("刷新输出失败")?;
     let mut line = String::new();
@@ -1887,5 +2480,106 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|item| item.season_no() == 1));
+    }
+
+    #[test]
+    fn task_refs_number_active_before_queued() {
+        let mut state = Snapshot::default();
+        state.servers.insert(
+            "media".into(),
+            crate::manager::ServerView {
+                active: vec![crate::manager::ActiveView {
+                    id: 7,
+                    title: "正在下".into(),
+                    ..Default::default()
+                }],
+                queue: vec![crate::manager::QueueView {
+                    id: 8,
+                    title: "排队中".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let refs = task_refs(&state);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].id, 7);
+        assert!(refs[0].active);
+        assert_eq!(refs[1].id, 8);
+        assert!(!refs[1].active);
+    }
+
+    #[test]
+    fn retry_refs_collect_failed_jobs() {
+        let mut state = Snapshot::default();
+        state.servers.insert(
+            "media".into(),
+            crate::manager::ServerView {
+                retryable: vec![
+                    crate::manager::QueueView {
+                        id: 3,
+                        title: "失败一".into(),
+                        ..Default::default()
+                    },
+                    crate::manager::QueueView {
+                        id: 4,
+                        title: "失败二".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let refs = retry_refs(&state);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].server, "media");
+        assert_eq!(refs[1].id, 4);
+    }
+
+    #[test]
+    fn queue_rows_group_episodes_by_season() {
+        let episode = |id: u64, episode: i32| crate::manager::QueueView {
+            id,
+            title: format!("第 {episode} 集"),
+            series: Some("某剧".into()),
+            season: Some(1),
+            episode: Some(episode),
+        };
+        let mut state = Snapshot::default();
+        state.servers.insert(
+            "media".into(),
+            crate::manager::ServerView {
+                queue: vec![
+                    episode(1, 1),
+                    episode(2, 2),
+                    crate::manager::QueueView {
+                        id: 3,
+                        title: "电影".into(),
+                        ..Default::default()
+                    },
+                    episode(4, 3),
+                ],
+                ..Default::default()
+            },
+        );
+        let tasks = task_refs(&state);
+        let rows = queue_rows(&state, &tasks);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].number_label(), "1-2,4");
+        assert_eq!(rows[0].label(), "某剧 S01（3 集）");
+        assert_eq!(rows[1].number_label(), "3");
+        assert_eq!(rows[1].label(), "电影");
+
+        // 单集时保留季集与单集标题，不丢失具体是哪一集。
+        let mut single = Snapshot::default();
+        single.servers.insert(
+            "media".into(),
+            crate::manager::ServerView {
+                queue: vec![episode(9, 2)],
+                ..Default::default()
+            },
+        );
+        let rows = queue_rows(&single, &task_refs(&single));
+        assert_eq!(rows[0].label(), "某剧 S01E02 · 第 2 集");
     }
 }

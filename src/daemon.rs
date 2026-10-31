@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::SignalKind;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::download::DownloadOpts;
 use crate::emby::{Client, ClientCreds};
@@ -36,7 +36,7 @@ use crate::store;
 /// 0.0.3 及更早的守护进程没有这个字段；交互模式检测到旧服务后会先让它优雅退出，
 /// 再拉起当前版本的守护进程（队列已落盘，会继续下载）。
 /// 新增/修改请求或快照字段时递增。
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -51,6 +51,14 @@ enum Request {
         server: String,
     },
     CancelAll,
+    CancelJob {
+        server: String,
+        id: u64,
+    },
+    RetryJob {
+        server: String,
+        id: u64,
+    },
     PauseServer {
         server: String,
     },
@@ -204,6 +212,37 @@ fn handle(req: Request, manager: &Manager) -> Response {
             manager.cancel_all();
             Response::ok()
         }
+        Request::CancelJob { server, id } => {
+            let state = manager.snapshot();
+            let exists = state
+                .servers
+                .get(&server)
+                .map(|s| {
+                    s.queue.iter().any(|job| job.id == id)
+                        || s.active.iter().any(|job| job.id == id)
+                })
+                .unwrap_or(false);
+            if exists {
+                manager.cancel_job(&server, id);
+                Response::ok()
+            } else {
+                Response::err(format!("任务 {id} 不存在或已结束"))
+            }
+        }
+        Request::RetryJob { server, id } => {
+            let state = manager.snapshot();
+            let exists = state
+                .servers
+                .get(&server)
+                .map(|s| s.retryable.iter().any(|job| job.id == id))
+                .unwrap_or(false);
+            if exists {
+                manager.retry_job(&server, id);
+                Response::ok()
+            } else {
+                Response::err(format!("任务 {id} 不可重试"))
+            }
+        }
         Request::PauseServer { server } => {
             if manager.snapshot().servers.contains_key(&server) {
                 manager.pause_server(&server);
@@ -318,11 +357,17 @@ fn process_is_running(pid: u32) -> bool {
 
 // ───────────────────────── 界面侧客户端 ─────────────────────────
 
+/// 交互模式发往后端的命令；需要确认的操作通过 `reply` 等待回执。
+struct UiCommand {
+    request: Request,
+    reply: Option<oneshot::Sender<Result<()>>>,
+}
+
 /// 交互模式持有的后台服务句柄：缓存最新快照，后台任务负责连接/重连。
 pub struct DaemonHandle {
     snapshot: Arc<Mutex<Snapshot>>,
     error: Arc<Mutex<Option<String>>>,
-    tx: mpsc::UnboundedSender<Request>,
+    tx: mpsc::UnboundedSender<UiCommand>,
 }
 
 impl DaemonHandle {
@@ -353,7 +398,26 @@ impl DaemonHandle {
     }
 
     fn send(&self, req: Request) {
-        let _ = self.tx.send(req);
+        let _ = self.tx.send(UiCommand {
+            request: req,
+            reply: None,
+        });
+    }
+
+    /// 发送命令并等待后台确认（成功/失败）。
+    async fn call(&self, req: Request) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(UiCommand {
+                request: req,
+                reply: Some(reply),
+            })
+            .map_err(|_| anyhow::anyhow!("后台下载服务未连接"))?;
+        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => bail!("后台下载服务未响应"),
+            Err(_) => bail!("后台下载服务响应超时"),
+        }
     }
 
     pub fn enqueue(&self, server: String, client: Client, items: Vec<Item>, opts: DownloadOpts) {
@@ -365,38 +429,57 @@ impl DaemonHandle {
         });
     }
 
-    pub fn cancel_server(&self, server: &str) {
-        self.send(Request::CancelServer {
+    pub async fn cancel_server(&self, server: &str) -> Result<()> {
+        self.call(Request::CancelServer {
             server: server.to_string(),
-        });
+        })
+        .await
     }
 
-    pub fn cancel_all(&self) {
-        self.send(Request::CancelAll);
+    pub async fn cancel_all(&self) -> Result<()> {
+        self.call(Request::CancelAll).await
     }
 
-    pub fn pause_server(&self, server: &str) {
-        self.send(Request::PauseServer {
+    pub async fn cancel_job(&self, server: &str, id: u64) -> Result<()> {
+        self.call(Request::CancelJob {
             server: server.to_string(),
-        });
+            id,
+        })
+        .await
     }
 
-    pub fn resume_server(&self, server: &str) {
-        self.send(Request::ResumeServer {
+    pub async fn retry_job(&self, server: &str, id: u64) -> Result<()> {
+        self.call(Request::RetryJob {
             server: server.to_string(),
-        });
+            id,
+        })
+        .await
     }
 
-    pub fn pause_all(&self) {
-        self.send(Request::PauseAll);
+    pub async fn pause_server(&self, server: &str) -> Result<()> {
+        self.call(Request::PauseServer {
+            server: server.to_string(),
+        })
+        .await
     }
 
-    pub fn resume_all(&self) {
-        self.send(Request::ResumeAll);
+    pub async fn resume_server(&self, server: &str) -> Result<()> {
+        self.call(Request::ResumeServer {
+            server: server.to_string(),
+        })
+        .await
     }
 
-    pub fn clear_finished(&self) {
-        self.send(Request::ClearHistory);
+    pub async fn pause_all(&self) -> Result<()> {
+        self.call(Request::PauseAll).await
+    }
+
+    pub async fn resume_all(&self) -> Result<()> {
+        self.call(Request::ResumeAll).await
+    }
+
+    pub async fn clear_finished(&self) -> Result<()> {
+        self.call(Request::ClearHistory).await
     }
 }
 
@@ -432,7 +515,7 @@ async fn send_cli(request: Request) -> Result<()> {
 }
 
 async fn connection_task(
-    mut rx: mpsc::UnboundedReceiver<Request>,
+    mut rx: mpsc::UnboundedReceiver<UiCommand>,
     snapshot: Arc<Mutex<Snapshot>>,
     error: Arc<Mutex<Option<String>>>,
 ) {
@@ -514,7 +597,7 @@ async fn connect_daemon() -> Result<Connection> {
 }
 
 async fn run_connection(
-    rx: &mut mpsc::UnboundedReceiver<Request>,
+    rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     snapshot: &Arc<Mutex<Snapshot>>,
 ) -> Result<()> {
     let mut conn = connect_daemon().await?;
@@ -523,20 +606,39 @@ async fn run_connection(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let request = tokio::select! {
-            _ = tick.tick() => Request::Snapshot,
+        let command = tokio::select! {
+            _ = tick.tick() => None,
             // 界面/交互模式正常退出时句柄被释放，连接任务也安静结束。
-            req = rx.recv() => match req {
-                Some(req) => req,
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => Some(cmd),
                 None => return Ok(()),
             },
+        };
+        let (request, reply) = match command {
+            Some(UiCommand { request, reply }) => (request, reply),
+            None => (Request::Snapshot, None),
         };
         let resp = conn.request(&request).await?;
         if let Some(state) = resp.state {
             *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = state;
         }
-        if !resp.ok {
-            bail!(resp.error.unwrap_or_else(|| "后台服务返回未知错误".into()));
+        match reply {
+            Some(reply) => {
+                let result = if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        resp.error
+                            .unwrap_or_else(|| "后台服务返回未知错误".to_string())
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            None => {
+                if !resp.ok {
+                    bail!(resp.error.unwrap_or_else(|| "后台服务返回未知错误".into()));
+                }
+            }
         }
     }
 }
@@ -684,7 +786,7 @@ mod tests {
         let text = serde_json::to_string(&Response::state(Snapshot::default())).unwrap();
         assert!(text.contains("\"ok\":true"));
         assert!(text.contains("\"state\""));
-        assert!(text.contains("\"protocol\":2"));
+        assert!(text.contains("\"protocol\":4"));
 
         let text = serde_json::to_string(&Response::err("boom")).unwrap();
         assert!(text.contains("\"ok\":false"));

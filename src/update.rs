@@ -109,7 +109,7 @@ pub async fn run(check: bool, version: Option<String>, force: bool) -> Result<()
         }
         Ok(false) => {}
         Err(e) => {
-            println!("⚠️  未能停止旧后台服务：{e:#}");
+            println!("! 未能停止旧后台服务：{e:#}");
             println!("   它仍在使用旧版本；可手动结束后重试。");
         }
     }

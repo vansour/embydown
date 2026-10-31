@@ -16,9 +16,10 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal", "net"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 indicatif = "0.18"
+rustyline = "19"
 sha2 = "0.10"
 unicode-width = "0.2"
 

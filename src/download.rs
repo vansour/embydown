@@ -1363,7 +1363,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
         let cancel = cancel.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("\n⚠️  收到中断，正在收尾（已完成分块已记录，重跑同一命令可续传）…");
+                eprintln!("\n! 收到中断，正在收尾（已完成分块已记录，重跑同一命令可续传）…");
                 cancel.store(true, Ordering::SeqCst);
             }
         });
@@ -1394,7 +1394,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
             break;
         }
         if fail_streak.load(Ordering::SeqCst) >= 3 {
-            eprintln!("⚠️  连续 3 个条目失败，停止派发（先用 --verbose 看具体错误）");
+            eprintln!("! 连续 3 个条目失败，停止派发（先用 --verbose 看具体错误）");
             break;
         }
         let permit = sem.clone().acquire_owned().await.context("并发控制失败")?;
@@ -1508,7 +1508,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
                 Err(e) => {
                     pb.finish_and_clear();
                     eprintln!(
-                        "❌ {rel}\n   {}",
+                        "✗ {rel}\n   {}",
                         emby::redact_text(&format!("{e:#}"))
                     );
                     fail_streak.fetch_add(1, Ordering::SeqCst);
@@ -1530,7 +1530,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
             Ok(TaskResult::Failed) => stats.failed += 1,
             Err(e) => {
                 stats.failed += 1;
-                eprintln!("❌ 任务异常: {e}");
+                eprintln!("✗ 任务异常: {e}");
             }
         }
     }

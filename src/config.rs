@@ -33,10 +33,6 @@ pub struct Settings {
     pub temp_dir: String,
     /// 最终文件夹：审查通过后用 `embydown sync` 复制到这里。
     pub final_dir: String,
-    /// CD2 gRPC 地址（秒传测试）；空表示使用 CD2_URL 或默认地址。
-    pub cd2_url: String,
-    /// CD2 API 令牌（秒传测试）；空表示使用环境变量或不鉴权。
-    pub cd2_token: String,
     pub connections: usize,
     pub jobs: usize,
     pub limit: String,
@@ -51,8 +47,6 @@ impl Default for Settings {
         Self {
             temp_dir: "./downloads".into(),
             final_dir: "./library".into(),
-            cd2_url: String::new(),
-            cd2_token: String::new(),
             connections: 2,
             jobs: 2,
             limit: String::new(),
@@ -404,8 +398,6 @@ mod tests {
         assert_eq!(legacy.settings.connections, 2);
         assert_eq!(legacy.settings.jobs, 2);
         assert!(legacy.settings.resume);
-        assert_eq!(legacy.settings.cd2_url, "");
-        assert_eq!(legacy.settings.cd2_token, "");
 
         // 旧配置里的 out 键迁移到 temp_dir。
         let old_key: Config =

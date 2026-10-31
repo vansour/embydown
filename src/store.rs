@@ -124,7 +124,7 @@ pub fn load_state() -> Option<PersistedState> {
     match state_path() {
         Ok(path) => load_state_from(&path),
         Err(e) => {
-            eprintln!("⚠️  无法确定队列文件位置: {e:#}");
+            eprintln!("! 无法确定队列文件位置: {e:#}");
             None
         }
     }
@@ -135,7 +135,7 @@ pub fn load_state_from(path: &Path) -> Option<PersistedState> {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!("⚠️  读取队列文件 {} 失败: {e}", path.display());
+            eprintln!("! 读取队列文件 {} 失败: {e}", path.display());
             return None;
         }
     };
@@ -146,13 +146,13 @@ pub fn load_state_from(path: &Path) -> Option<PersistedState> {
         }
         Ok(state) => {
             eprintln!(
-                "⚠️  队列文件版本 {} 无法识别（当前 {}），本次不恢复旧队列",
+                "! 队列文件版本 {} 无法识别（当前 {}），本次不恢复旧队列",
                 state.version, STATE_VERSION
             );
             None
         }
         Err(e) => {
-            eprintln!("⚠️  队列文件 {} 已损坏: {e}", path.display());
+            eprintln!("! 队列文件 {} 已损坏: {e}", path.display());
             None
         }
     }
@@ -219,7 +219,7 @@ pub fn load_history_from(path: &Path) -> Vec<HistoryRecord> {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
-            eprintln!("⚠️  读取下载记录 {} 失败: {e}", path.display());
+            eprintln!("! 读取下载记录 {} 失败: {e}", path.display());
             return Vec::new();
         }
     };

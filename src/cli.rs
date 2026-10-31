@@ -8,7 +8,7 @@ use std::path::PathBuf;
     name = "embydown",
     version,
     about = "Emby 媒体下载工具（默认直链：static stream / Download）",
-    long_about = "Emby 媒体下载工具。\n\n直接运行 `embydown`（或 `embydown ui`）进入命令行交互模式：数字菜单选择搜索、浏览媒体库、管理服务器、下载队列与设置。\n也可以使用子命令：先运行 `embydown login --server <URL> --user <账号> --password <密码>` 保存登录信息；\n可重复 login（配合 --name）同时登录多个服务器，`embydown servers` 查看。\ndl 默认覆盖所有服务器；`dl <关键字> --dry-run` 会列出匹配文件的大小、分辨率、编码等信息。\n默认使用直链下载原始文件（/Videos/{id}/stream?static=true，失败回退 /Items/{id}/Download），\n支持分块并发、断点续传与整季批量下载。\n下载先落到临时文件夹；`embydown review` 在本地审查缺集/异常，`embydown sync` 复制到最终文件夹。\n最终文件夹是 CD2 等网盘挂载时，可用 `embydown upload-test <剧名>` 只下载第一集并检测是否秒传。\n安装一次后可运行 `embydown update` 自更新，无需 curl。"
+    long_about = "Emby 媒体下载工具。\n\n直接运行 `embydown`（或 `embydown ui`）进入命令行交互模式：数字菜单选择搜索、浏览媒体库、管理服务器、下载队列与设置。\n也可以使用子命令：先运行 `embydown login --server <URL> --user <账号> --password <密码>` 保存登录信息；\n可重复 login（配合 --name）同时登录多个服务器，`embydown servers` 查看。\ndl 默认覆盖所有服务器；`dl <关键字> --dry-run` 会列出匹配文件的大小、分辨率、编码等信息。\n默认使用直链下载原始文件（/Videos/{id}/stream?static=true，失败回退 /Items/{id}/Download），\n支持分块并发、断点续传与整季批量下载。\n下载先落到临时文件夹；`embydown review` 在本地审查缺集/异常，`embydown sync` 复制到最终文件夹。\n安装一次后可运行 `embydown update` 自更新，无需 curl。"
 )]
 pub struct Cli {
     /// 详细日志：-v 常规，-vv 调试
@@ -109,44 +109,6 @@ pub enum Cmd {
         /// 即使大小相同也重新复制
         #[arg(long)]
         force: bool,
-
-        /// 临时文件夹（默认使用配置中的下载目录）
-        #[arg(long, value_name = "DIR")]
-        temp: Option<PathBuf>,
-
-        /// 最终文件夹（默认使用配置中的最终文件夹）
-        #[arg(long = "final", value_name = "DIR")]
-        final_dir: Option<PathBuf>,
-    },
-
-    /// 秒传测试：只下载第一集并移动到最终文件夹，查询 CD2 上传任务判断是否秒传
-    #[command(alias = "quicktest", alias = "instant-test")]
-    UploadTest {
-        #[command(flatten)]
-        server: ServerArg,
-
-        /// 条目 ID、片名/剧名关键字，或 `服务器:ID`
-        target: String,
-
-        /// 按关键字匹配时的结果上限
-        #[arg(long, default_value_t = 30)]
-        limit: u32,
-
-        /// CD2 地址：原生 gRPC（http://host:19798）或 CD2 Web UI/API 地址（自动使用 gRPC-Web）
-        #[arg(long, value_name = "URL")]
-        cd2_url: Option<String>,
-
-        /// CD2 API 令牌（默认使用配置中的令牌或 CLOUDDRIVE_API_TOKEN）
-        #[arg(long, value_name = "TOKEN")]
-        cd2_token: Option<String>,
-
-        /// 观察 CD2 上传任务的秒数
-        #[arg(long, default_value_t = 20)]
-        window: u64,
-
-        /// 保留最终文件夹中的测试目录（默认测试后删除）
-        #[arg(long)]
-        keep: bool,
 
         /// 临时文件夹（默认使用配置中的下载目录）
         #[arg(long, value_name = "DIR")]
