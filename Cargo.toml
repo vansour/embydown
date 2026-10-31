@@ -1,6 +1,6 @@
 [package]
 name = "embydown"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.99"
 description = "Emby 媒体下载工具：默认走直链（static stream / Download），支持分块并发与断点续传"

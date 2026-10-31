@@ -1,9 +1,9 @@
 # 变更记录
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
-发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.7` ↔ `0.0.7`）。
+发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.8` ↔ `0.0.8`）。
 
-## [Unreleased]
+## [0.0.8] - 2026-10-31
 
 ### 变更
 
@@ -165,6 +165,7 @@
 - 一键安装脚本 `install.sh`。
 - GitHub Actions：CI 与 tag 发布 Release。
 
+[0.0.8]: https://github.com/vansour/embydown/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/vansour/embydown/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/vansour/embydown/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/vansour/embydown/compare/v0.0.4...v0.0.5
