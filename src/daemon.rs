@@ -1,8 +1,8 @@
 //! 后台下载守护进程。
 //!
-//! TUI 不再自己执行下载：它只通过 `$XDG_RUNTIME_DIR/embydown/daemon.sock`
+//! 交互模式不再自己执行下载：它只通过 `$XDG_RUNTIME_DIR/embydown/daemon.sock`
 //! 发送「入队 / 取消 / 查询」请求。守护进程是独立的 setsid 子进程，所以：
-//! - TUI 崩溃、Ctrl+C、直接关掉终端，下载都不受影响；
+//! - 交互模式崩溃、Ctrl+C、直接关掉终端，下载都不受影响；
 //! - 队列与完成记录由守护进程落盘，重启后可从断点继续。
 //!
 //! 单实例：socket + `daemon.lock`（PID 锁）双重保证不会重复下载同一批文件。
@@ -33,7 +33,7 @@ use crate::store;
 
 /// 后台服务协议版本。
 ///
-/// 0.0.3 及更早的守护进程没有这个字段；TUI 检测到旧服务后会先让它优雅退出，
+/// 0.0.3 及更早的守护进程没有这个字段；交互模式检测到旧服务后会先让它优雅退出，
 /// 再拉起当前版本的守护进程（队列已落盘，会继续下载）。
 /// 新增/修改请求或快照字段时递增。
 const PROTOCOL_VERSION: u32 = 2;
@@ -107,7 +107,7 @@ impl Response {
 
 // ───────────────────────── 守护进程 ─────────────────────────
 
-/// 运行后台下载服务（`embydown daemon`），通常由 TUI 自动拉起。
+/// 运行后台下载服务（`embydown daemon`），通常由交互模式自动拉起。
 pub async fn run() -> Result<()> {
     let socket = store::socket_path()?;
     let lock_path = store::lock_path()?;
@@ -318,7 +318,7 @@ fn process_is_running(pid: u32) -> bool {
 
 // ───────────────────────── 界面侧客户端 ─────────────────────────
 
-/// TUI 持有的后台服务句柄：缓存最新快照，后台任务负责连接/重连。
+/// 交互模式持有的后台服务句柄：缓存最新快照，后台任务负责连接/重连。
 pub struct DaemonHandle {
     snapshot: Arc<Mutex<Snapshot>>,
     error: Arc<Mutex<Option<String>>>,
@@ -344,7 +344,7 @@ impl DaemonHandle {
         self.snapshot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 取出并清空最近一次后台通信错误（由 TUI 状态栏显示）。
+    /// 取出并清空最近一次后台通信错误（由交互模式状态栏显示）。
     pub fn take_error(&self) -> Option<String> {
         self.error
             .lock()
@@ -525,7 +525,11 @@ async fn run_connection(
     loop {
         let request = tokio::select! {
             _ = tick.tick() => Request::Snapshot,
-            req = rx.recv() => req.context("界面已退出")?,
+            // 界面/交互模式正常退出时句柄被释放，连接任务也安静结束。
+            req = rx.recv() => match req {
+                Some(req) => req,
+                None => return Ok(()),
+            },
         };
         let resp = conn.request(&request).await?;
         if let Some(state) = resp.state {
@@ -592,7 +596,29 @@ async fn stop_old_daemon() -> Result<()> {
     bail!("旧版后台服务（PID {pid}）未在 3 秒内退出")
 }
 
-/// 以独立进程组启动 `embydown daemon`：不随 TUI 一起被 Ctrl+C 结束。
+/// 自更新完成后让后台服务改用新二进制；没有在运行时返回 `false`。
+///
+/// 正在下载的任务会保留 `.part` 并在下次启动时续传。
+pub async fn stop_running_daemon() -> Result<bool> {
+    let lock = store::lock_path()?;
+    if !lock.exists() {
+        return Ok(false);
+    }
+    let Ok(text) = std::fs::read_to_string(&lock) else {
+        return Ok(false);
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return Ok(false);
+    };
+    if !process_is_running(pid) {
+        let _ = std::fs::remove_file(&lock);
+        return Ok(false);
+    }
+    stop_old_daemon().await?;
+    Ok(true)
+}
+
+/// 以独立进程组启动 `embydown daemon`：不随交互模式一起被 Ctrl+C 结束。
 fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("无法定位 embydown 可执行文件")?;
     let log = store::log_path()?;
@@ -687,7 +713,7 @@ mod tests {
 
     #[test]
     fn old_daemon_response_has_no_protocol_field() {
-        // 0.0.3 的响应没有 protocol；TUI 据此判断需要重启后台服务。
+        // 0.0.3 的响应没有 protocol；交互模式据此判断需要重启后台服务。
         let old: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(old.protocol, None);
         assert_ne!(old.protocol, Some(PROTOCOL_VERSION));

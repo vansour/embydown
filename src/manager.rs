@@ -1,10 +1,10 @@
 //! 后台下载队列。
 //!
 //! 每个服务器一条独立的下载流：有自己的队列、并发数和限速器，互不阻塞。
-//! 下载任务在后台运行，进度通过隐藏的 `ProgressBar` 暴露给 TUI。
+//! 下载任务在后台运行，进度通过隐藏的 `ProgressBar` 暴露给交互模式。
 //!
-//! 队列与完成记录都会落盘（见 [`crate::store`]）：TUI 以独立进程的方式
-//! 通过 Unix socket 控制本模块，因此 TUI 崩溃/关闭不会中断下载；守护进程
+//! 队列与完成记录都会落盘（见 [`crate::store`]）：交互模式以独立进程的方式
+//! 通过 Unix socket 控制本模块，因此 交互模式崩溃/关闭不会中断下载；守护进程
 //! 重启时也会从 `queue.json` 恢复未完成的任务。
 
 use std::collections::{BTreeMap, VecDeque};
@@ -77,13 +77,13 @@ pub struct Finished {
     pub title: String,
     pub status: FinishedStatus,
     pub bytes: u64,
-    /// 失败原因（成功/跳过时为空），TUI 里显示在标题后面。
+    /// 失败原因（成功/跳过时为空），交互模式里显示在标题后面。
     pub error: Option<String>,
 }
 
 // ───────────────────────── 可序列化的界面快照 ─────────────────────────
 
-/// 守护进程每秒推给 TUI 的状态。
+/// 守护进程每秒推给交互模式的状态。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -209,7 +209,7 @@ impl Manager {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 供 TUI 轮询的可序列化快照。
+    /// 供交互模式轮询的可序列化快照。
     pub fn snapshot(&self) -> Snapshot {
         let st = self.state();
         snapshot_of(&st)
@@ -711,7 +711,7 @@ fn dispatch(
         tokio::spawn(async move {
             use futures_util::FutureExt;
             // 下载任务内部的 panic 若逃出 tokio::spawn，就不会发送 Completed，
-            // ActiveJob 会永久占用并发槽位（TUI 里显示“运行”且删不掉）。
+            // ActiveJob 会永久占用并发槽位（交互模式里显示“运行”且删不掉）。
             let outcome = std::panic::AssertUnwindSafe(download::download_one(
                 &client, &job.item, &job.opts, &limiter, &cancel, &pb,
             ))

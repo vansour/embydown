@@ -5,7 +5,7 @@
 
 用 Rust 写的 Emby 媒体下载工具。**默认走直链**（`/Videos/{id}/stream?static=true`，失败自动回退官方 `/Items/{id}/Download`），支持分块并发、断点续传、整季批量、外挂字幕。
 
-不带任何子命令直接运行 `embydown` 会进入**交互界面（TUI）**；`embydown ui` 等价。
+不带任何子命令直接运行 `embydown` 会进入**命令行交互模式**（数字菜单）；`embydown ui` 等价。
 
 > **仅适配 Linux**（ext4 / xfs / btrfs / tmpfs 实测）。Windows 的文件名与 rename 语义不在支持范围内。
 
@@ -28,6 +28,21 @@ curl -fsSL https://raw.githubusercontent.com/vansour/embydown/main/install.sh | 
 - 目前提供 **x86_64 + glibc** 预编译包；ARM / Alpine(musl) 请从源码构建
 - 也可以直接在 [Releases](https://github.com/vansour/embydown/releases) 下载
   `embydown-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+
+首次安装使用上面的脚本即可。**安装一次后，后续升级直接用 `embydown update`，不再需要 curl：**
+
+```bash
+embydown update                 # 更新到最新正式版
+embydown update --check         # 只检查版本，不下载
+embydown update --version v0.0.5
+embydown update --force         # 已是最新版本也重新安装
+```
+
+- 从 GitHub Releases 下载当前架构的裸二进制，校验 SHA-256 后原子替换当前可执行文件
+- 安装在 `/usr/local/bin` 等目录时，需要对该目录有写权限（用 `sudo embydown update`）
+- 更新后会自动停止旧的后台下载服务；队列与 `.part` 断点保留，下次运行自动续传
+- 可通过 `EMBYDOWN_RELEASE_BASE=https://mirror.example.com/embydown/releases/download`
+  指向镜像（配合 `--version` 使用）
 
 ## 构建
 
@@ -64,61 +79,77 @@ embydown logout --name vod2
 embydown logout
 ```
 
-## 交互界面（TUI）
+## 命令行交互模式
 
 ```bash
-embydown          # 直接进入
-embydown ui       # 等价写法
+embydown              # 直接进入
+embydown ui           # 等价写法（也可以写 embydown interactive）
 ```
 
-五个页面（`Tab` / `1-5` 切换）：
+运行后显示数字菜单：
 
-| 页面 | 功能 |
+| 菜单 | 功能 |
 |---|---|
-| 搜索 | 跨服务器搜索；也接受 `http(s)://` 直链，`Enter` 打开下载确认 |
-| 浏览 | 服务器 → 媒体库 → 剧集 / 季 / 分集逐层浏览 |
-| 下载 | 后台下载队列：每个服务器一条独立下载流，显示进度、排队、完成/失败统计 |
-| 服务器 | `a` 登录（账号密码 / API Key）、`d` 删除、`Enter` 设为搜索范围 |
-| 设置 | 输出目录、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
+| 1 搜索并下载 | 跨服务器搜索：先选影片、再选来源；也接受 `http(s)://` 直链 |
+| 2 浏览媒体库 | 服务器 → 媒体库 → 剧集 / 季 / 分集逐层浏览，选中条目下载；`d` 下载当前目录 |
+| 3 下载队列 | 每个服务器一条独立下载流，显示进度、排队、完成/失败统计；可暂停/继续、取消、清空记录 |
+| 4 服务器管理 | 添加登录（账号密码 / API Key）、删除、设置搜索范围 |
+| 5 下载设置 | 临时文件夹、最终文件夹、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
+| 6 未完成任务找回 | 递归扫描 `.part` / `.part.json`，搜索来源并写回原路径续传 |
+| 7 下载记录 | 查看历史记录（最新在前） |
+| 8 本地审查 | 检查临时/最终文件夹的内容、缺集、损坏文件与同步差异 |
+| 9 同步到最终文件夹 | 把临时文件夹复制到最终文件夹（会先预览） |
+| 10 秒传测试 | 只下载第一集并移动到最终文件夹，通过 CD2 上传任务判断是否秒传 |
+
+菜单里直接回车会取消当前操作，`0` 返回上一级 / 退出，`Ctrl+C` 随时退出。
+界面使用颜色区分标题、快捷键与状态；设置环境变量 `NO_COLOR=1` 可关闭颜色。
 
 搜索结果按**相关度**排序：标题完全匹配 > 前缀匹配 > 包含匹配 > 剧名/路径匹配；
-多个服务器的结果合并后统一排序，同分时短标题优先。
+同一部影片在不同服务器上的结果会先聚合成一行，同分时短标题优先，剧集按季集排序。
 
-「设置」页的修改会立即写入配置文件（与登录信息同一个 `config.json`），重启 TUI 后仍然生效；
+搜索分两级选择，避免多个服务器的重复条目挤在一起：
+
+1. **选择影片**：列表中每行是一部影片/一集，显示类型、年份、季集、覆盖的服务器与来源数量。
+2. **选择来源**：选中影片后列出它的全部来源，逐行显示服务器、版本（多版本显示数量）、
+   体积、分辨率/编码/容器；**即使只有一个来源也会列出**。
+
+选定来源后会先解析条目，再按需选择季和版本，最后确认加入后台下载队列。
+
+「下载设置」的修改会立即写入配置文件（与登录信息同一个 `config.json`），重启交互模式后仍然生效；
 `logout` 只清除登录信息，不会重置这些下载设置。
 
-命令行 `embydown dl` 也把这些设置作为默认值（输出目录、连接数、并发、限速、字幕、覆盖、续传、命名模板），
+命令行 `embydown dl` 也把这些设置作为默认值（临时文件夹、连接数、并发、限速、字幕、覆盖、续传、命名模板），
 命令行显式传参时以命令行为准。默认每文件 2 个连接、同时下载 2 个文件（`-c 2 -j 2`）。
 需要临时反着覆盖时可用 `--no-overwrite`、`--no-resume`、`--no-subs`、
 `--no-limit-rate`；`--pattern ""` 表示本次使用内置默认命名模板。
 
-下载确认页会先解析条目：
+下载确认会先解析条目：
 
-- 列出所有版本及各自实际集数、体积、分辨率、容器；**必须用数字选择版本**（`0` / `a` = 全部版本）
-- `f` 选择要下载的季，`u` 查看直链，`Enter` 开始下载，`Esc` 取消
-- 搜索页和下载详情页的版本归类与 CLI 的 `--dry-run` / `--version` 完全一致
+- 剧集先列出包含的季，可输入 `1,2` 只下载部分季（回车 = 全部）
+- 有多个版本时列出各自实际集数、体积、分辨率、容器；用数字选择版本，`a` 下载全部版本
+- 版本归类与 CLI 的 `--dry-run` / `--version` 完全一致
 
-开始下载后界面不会退出：任务进入后台队列，可以继续搜索、浏览或切换页面。
+确认后回到主菜单：任务进入后台队列，可以继续搜索、浏览或查看队列。
 每个服务器有独立的队列、并发数和限速器，多个服务器会同时下载、互不阻塞；
 同一服务器内的任务按加入顺序排队，并发数由「每服务器并发数」控制。
 
-下载实际由独立的**后台下载服务**执行，所以关掉 TUI、`Ctrl+C`、甚至直接关闭终端都不会中断下载：
+下载实际由独立的**后台下载服务**执行，所以退出交互模式、`Ctrl+C`、甚至直接关闭终端都不会中断下载：
 
 ```bash
 embydown          # 重新打开即可看到仍在进行的下载
-embydown history  # 查看历史记录（包括 TUI 关闭期间完成的）
+embydown history  # 查看历史记录（包括交互模式关闭期间完成的）
 ```
 
-下载页按键：`↑↓` 选择服务器，`x` 取消该服务器的队列，`X` 取消全部，`p` 暂停/继续当前服务器（`P` 全部），
-`r` 扫描未完成任务，`c` 清空最近完成记录（同时删除历史文件）。
+下载队列菜单：`p` 暂停/继续当前服务器（`P` 全部），`x` 取消该服务器的队列（`X` 全部），
+`c` 清空最近完成记录（同时删除历史文件），`u` 找回未完成任务。
 取消或退出时已完成的分块会保留，重新加入同一任务即可续传。
 暂停会把正在运行的任务放回队首并保留 `.part`，继续后从断点续传；暂停状态会写入 `queue.json`，后台服务重启后仍然保持暂停。
 
-**未完成任务找回**：在下载页按 `r`，会递归扫描输出目录里的 `.part` / `.part.json`，
+**未完成任务找回**：选择「未完成任务找回」，会递归扫描临时文件夹里的 `.part` / `.part.json`，
 从文件名推导关键字（剧集取剧名并解析 `SxxExx`，电影去掉年份/质量标签），
 在所有服务器上搜索；剧集结果会自动展开 Series/Season，只匹配同一季集。
 选中一个来源后，下载会**写回原来的文件路径**并复用已有 `.part` 续传，不会生成一份新文件。
-不想开 TUI 时也可以用 CLI 控制（`--server <别名>` 只作用于单个服务器）：
+也可以直接用 CLI 控制（`--server <别名>` 只作用于单个服务器）：
 
 ```bash
 embydown pause                      # 暂停全部服务器
@@ -127,13 +158,71 @@ embydown resume                     # 继续全部
 embydown resume --server media.micu.hk
 ```
 
-按键：`1-5` / `Tab` 切页，`↑↓` 选择，`Enter` 确认，`Esc` 返回，`?` 查看全部快捷键，`Ctrl+C` 随时退出。
-搜索输入框内普通按键会输入文字，因此切页请用 `Tab`。
+## 本地审查与同步
+
+下载默认先落到**临时文件夹**（下载设置中的「临时文件夹」，命令行 `-o`），
+确认内容无误后再复制到**最终文件夹**（媒体库目录）。两个目录都在「下载设置」里配置，
+最终文件夹默认 `./library`。
+
+```bash
+# 审查：内容、缺集、重复集、未完成/损坏文件、临时与最终的差异
+embydown review
+embydown review --temp /data/downloads --final /data/media
+
+# 先预览同步计划，再真正复制
+embydown sync --dry-run
+embydown sync
+embydown sync --force          # 大小相同的文件也重新复制
+```
+
+审查完全在本地完成，不访问服务器：
+
+- 统计视频 / 字幕 / 元数据 / 图片数量与总大小，列出剧集（含季数）和影片
+- 按 `SxxExx` 检查集号连续性，报告缺集（如缺少 E03）与重复集（可能是多版本）
+- 检查空文件、HTML 错误页、视频文件头与扩展名不匹配，以及 `.part` / `.part.json` 等未完成文件
+- 对比临时 / 最终文件夹，列出待复制、待覆盖、已一致、仅最终有
+
+同步规则：
+
+- 默认只复制缺失文件和大小不一致的文件；`--force` 连大小相同的一起复制
+- `.part` 与异常文件会跳过并列出，修复后再次同步即可
+- 写入最终文件夹时先写同目录临时文件再 rename，避免留下半截文件
+- 最终文件夹里多出来的文件不会被删除
+- 临时文件夹与最终文件夹相同或互相包含时拒绝执行
+
+交互模式主菜单的 `8) 本地审查` 与 `9) 同步到最终文件夹` 对应这两个命令。
+
+## 秒传测试
+
+最终文件夹通常是 CD2 等网盘挂载。挂载写入是异步的：数据先落到本地缓存，
+FUSE 返回成功并不代表云端已经收到文件，所以不能靠写入耗时判断秒传。
+`upload-test` 只下载剧集的第一集并移动到最终文件夹，然后查询 CD2 的
+gRPC 上传任务（`GetUploadFileList`），观察该文件的 `status` 与 `transferredBytes`：
+
+```bash
+# 先让 embydown 连接 CD2（默认 http://127.0.0.1:19798）
+export CD2_URL=http://127.0.0.1:19798
+export CLOUDDRIVE_API_TOKEN=你的令牌   # CD2「设置 → API 令牌」
+
+# 只下载第一集并测试；--window 控制观察上传任务的秒数
+embydown upload-test "剧名" --server media.micu.hk
+embydown upload-test <SERIES_ID> --window 30
+embydown upload-test <SERIES_ID> --keep     # 保留最终文件夹里的测试目录
+```
+
+- 在最终文件夹下创建一次性测试目录（`_embydown_instant_test_*`），**不会覆盖真实媒体库**
+- 剧集自动选择第一集（常规季优先于特别篇）；同一集有多个版本时选体积最大的
+- 先检查 CD2 API 是否可用，再下载，避免白下载；连接失败会直接报错
+- 文件移动到测试目录时优先 `rename`，跨文件系统则复制 + 原子替换 + 删除源文件
+- 结论分为：**秒传**（`Skipped`，或完成时几乎没有实际传输）、**普通上传**
+  （检测到实际传输字节）、**上传失败**、**无法确认**（观察窗口内仍在预处理/排队）
+- 测试目录默认自动清理；`--keep` 保留供手动检查
+- 交互模式主菜单第 `10) 秒传测试` 对应此功能
 
 ## 后台下载服务与记录
 
-TUI 会自动拉起后台服务（`embydown daemon`），它与 TUI 是独立进程、独立进程组：
-TUI 崩溃或关闭终端时，服务会忽略挂断信号继续下载；下次打开 TUI 会重新连接并显示进度。
+交互模式的「下载队列」会自动拉起后台服务（`embydown daemon`），它与交互模式是独立进程、独立进程组：
+交互模式退出或关闭终端时，服务会忽略挂断信号继续下载；下次打开交互模式会重新连接并显示进度。
 
 - 单实例：通过 `$XDG_RUNTIME_DIR/embydown/daemon.sock` 通信，`daemon.lock` 记录 PID，避免两个服务同时下载同一批文件
 - `queue.json`：当前排队/运行中的任务（含服务器凭证、直链与暂停状态），服务重启时会把运行中的任务放回队首，配合 `.part` 续传
@@ -170,7 +259,7 @@ embydown dl 关键字 --dry-run --limit 50
 
 # 去掉 --dry-run 即可交互选择并下载
 embydown dl 关键字 -o ./downloads
-# 输出目录支持 ~ 展开：-o ~/Downloads 会存到 $HOME/Downloads
+# 临时文件夹支持 ~ 展开：-o ~/Downloads 会存到 $HOME/Downloads
 
 # 查看条目详情（含媒体源、流信息、大小）
 embydown info <ITEM_ID> --server media.micu.hk
@@ -210,6 +299,25 @@ embydown history --limit 200
 embydown pause
 embydown resume
 embydown pause --server media.micu.hk
+
+# 本地审查临时/最终文件夹（缺集、重复集、未完成/损坏文件、同步差异）
+embydown review
+embydown review --temp ./downloads --final ./library
+
+# 同步临时文件夹到最终文件夹（--dry-run 只预览）
+embydown sync --dry-run
+embydown sync
+embydown sync --force
+
+# 秒传测试：只下载第一集并移动到最终文件夹，通过 CD2 上传任务判断是否秒传
+embydown upload-test "剧名" --server media.micu.hk
+embydown upload-test <SERIES_ID> --window 30 --keep
+
+# 自更新（首次安装后不再需要 curl；下载并校验 SHA-256 后替换当前二进制）
+embydown update
+embydown update --check             # 只检查版本
+embydown update --version v0.0.5    # 安装指定版本
+embydown update --force             # 已是最新也重新安装
 ```
 
 ## 已在真实服务器验证
@@ -259,7 +367,7 @@ embydown pause --server media.micu.hk
 `{seriesyear}` 是剧集年份（展开时从 Series 容器或服务器路径补全），
 `{version}` 是多版本时的版本名（如 `2160p - WEB-DL`）。
 
-默认（Emby 标准目录结构，输出目录下自动分影视/电影、影视/剧集）：
+默认（Emby 标准目录结构，临时文件夹下自动分影视/电影、影视/剧集）：
 
 - 电影：`影视/电影/{title} ({year})/{title} ({year}).{ext}`
 - 剧集：`影视/剧集/{series} ({seriesyear})/Season {season5}/{series} - S{season5}E{episode5}.{ext}`
@@ -289,6 +397,7 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 
 - 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.4` 对应版本 `0.0.4`）
 - 构建 x86_64 release，打包二进制、README、CHANGELOG 和 install.sh，生成 SHA-256
+- 同时上传裸二进制（`embydown-vX.Y.Z-x86_64-unknown-linux-gnu.bin` 与稳定别名）供 `embydown update` 使用
 - 创建 GitHub Release 并上传产物
 
 ```bash
@@ -310,7 +419,7 @@ git push origin v0.0.4
 | `HTTP 404 page not found` | 地址漏了 `https://`，被 301 后登录 POST 降级成 GET。补全 scheme |
 | 直链 302 | 部分服务器把直链跳到 `/play/video/{id}` CDN；reqwest 自动跟随且保留 `Range`，无需处理 |
 | 卡在探测阶段 | 服务器前面有反代且未透传 `Range` 头；用 `-c 1` 走单连接 |
-| TUI 提示「后台下载服务连接失败」 | 看 `~/.config/embydown/daemon.log`；socket 默认在 `$XDG_RUNTIME_DIR/embydown/`，路径过长时设置较短的 `XDG_RUNTIME_DIR`；也可前台运行 `embydown daemon` 复现 |
+| 交互模式提示「后台下载服务连接失败」 | 看 `~/.config/embydown/daemon.log`；socket 默认在 `$XDG_RUNTIME_DIR/embydown/`，路径过长时设置较短的 `XDG_RUNTIME_DIR`；也可前台运行 `embydown daemon` 复现 |
 | 速度上不去 | 服务器出口/磁盘瓶颈；`-c` 调到 4–16 之间试；`-j` 控制文件级并发 |
 | 自签证书报错 | 加 `--insecure` |
 
@@ -326,12 +435,16 @@ src/emby.rs      Emby API 客户端（认证 / 浏览 / 直链构造）
 src/download.rs  分块并发、断点续传、限速、字幕
 src/naming.rs    命名模板
 src/table.rs     预览表格渲染（按中文双列宽对齐）
-src/tui.rs       交互界面（ratatui）
+src/interactive.rs 命令行交互模式（数字菜单）
 src/manager.rs   后台下载队列（每服务器一条下载流）
 src/daemon.rs    后台下载服务（Unix socket 协议、单实例、自动拉起）
 src/store.rs     队列与下载记录持久化（queue.json / history.jsonl）
 src/repair.rs    未完成任务扫描、关键字推导与来源匹配
+src/review.rs    本地审查与临时 → 最终文件夹同步
+src/instant.rs   秒传测试（第一集下载、移动、CD2 上传观察）
+src/cd2.rs       CloudDrive2 上传任务 gRPC 客户端
 src/model.rs     API 数据模型
+src/update.rs    自更新（GitHub Releases + SHA-256 + 原子替换）
 install.sh       一键安装脚本
 CHANGELOG.md     版本变更记录
 .github/workflows/  CI 与 tag 发布

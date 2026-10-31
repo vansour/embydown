@@ -51,6 +51,12 @@ jobs:
           cp "dist/${asset}.tar.gz" "dist/embydown-${target}.tar.gz"
           ( cd dist && sha256sum "embydown-${target}.tar.gz" > "embydown-${target}.tar.gz.sha256" )
 
+          # 自更新（embydown update）用的裸二进制，无需解包
+          cp target/release/embydown "dist/embydown-${GITHUB_REF_NAME}-${target}.bin"
+          ( cd dist && sha256sum "embydown-${GITHUB_REF_NAME}-${target}.bin" > "embydown-${GITHUB_REF_NAME}-${target}.bin.sha256" )
+          cp target/release/embydown "dist/embydown-${target}.bin"
+          ( cd dist && sha256sum "embydown-${target}.bin" > "embydown-${target}.bin.sha256" )
+
           ls -lh dist/
 
       - name: Extract release notes from CHANGELOG
@@ -91,4 +97,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/embydown-v*-x86_64-unknown-linux-gnu.bin
+            dist/embydown-x86_64-unknown-linux-gnu.bin
             install.sh

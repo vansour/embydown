@@ -1,17 +1,21 @@
 //! embydown —— Emby 媒体下载工具（默认直链）。
 
 mod cli;
+mod cd2;
 mod config;
 mod daemon;
 mod download;
 mod emby;
+mod instant;
+mod interactive;
 mod manager;
 mod model;
 mod naming;
 mod repair;
+mod review;
 mod store;
 mod table;
-mod tui;
+mod update;
 mod util;
 
 use anyhow::{bail, Context, Result};
@@ -41,10 +45,10 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let Some(cmd) = cli.cmd else {
-        return tui::run().await;
+        return interactive::run().await;
     };
     match cmd {
-        Cmd::Ui => tui::run().await,
+        Cmd::Ui => interactive::run().await,
         Cmd::Daemon => daemon::run().await,
         Cmd::History { limit } => print_history(limit),
         Cmd::Pause { server } => {
@@ -66,6 +70,46 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Login(args) => login(args).await,
         Cmd::Logout { name } => logout(name),
         Cmd::Servers => list_servers(),
+        Cmd::Update {
+            check,
+            version,
+            force,
+        } => update::run(check, version, force).await,
+        Cmd::Review { temp, final_dir } => review::run(temp, final_dir),
+        Cmd::Sync {
+            dry_run,
+            force,
+            temp,
+            final_dir,
+        } => review::sync(temp, final_dir, dry_run, force),
+        Cmd::UploadTest {
+            server,
+            target,
+            limit,
+            cd2_url,
+            cd2_token,
+            window,
+            keep,
+            temp,
+            final_dir,
+        } => {
+            instant::run(
+                &target,
+                server.server.as_deref(),
+                limit,
+                instant::Options {
+                    cd2: cd2::Config {
+                        url: cd2_url,
+                        token: cd2_token,
+                    },
+                    window: std::time::Duration::from_secs(window.max(1)),
+                    keep,
+                    temp_dir: temp,
+                    final_dir,
+                },
+            )
+            .await
+        }
         cmd => run_command(cmd).await,
     }
 }
@@ -385,13 +429,13 @@ async fn run_command(cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
 
-            // 命令行显式参数优先；未指定时使用 TUI「设置」页保存的配置。
+            // 命令行显式参数优先；未指定时使用交互模式「下载设置」保存的配置。
             let settings = &cfg.settings;
 
             let out = match out {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => {
-                    let configured = settings.out.trim();
+                    let configured = settings.temp_dir.trim();
                     if configured.is_empty() {
                         std::path::PathBuf::from("./downloads")
                     } else {
@@ -420,7 +464,7 @@ async fn run_command(cmd: Cmd) -> Result<()> {
                 } else {
                     Some(util::parse_rate(s).with_context(|| {
                         format!(
-                            "配置文件中的限速值无效: {s}（修改 TUI「设置」或加 --no-limit-rate）"
+                            "配置文件中的限速值无效: {s}（修改交互模式的「下载设置」或加 --no-limit-rate）"
                         )
                     })?)
                 }
@@ -462,8 +506,12 @@ async fn run_command(cmd: Cmd) -> Result<()> {
                 settings.resume
             };
 
-            let (client, root) = if is_url {
-                (Client::new("http://127.0.0.1", false)?, direct_item(&target))
+            let (_server_name, client, root) = if is_url {
+                (
+                    "（直链）".to_string(),
+                    Client::new("http://127.0.0.1", false)?,
+                    direct_item(&target),
+                )
             } else {
                 pick_item(&cfg, server.server.as_deref(), &target, limit).await?
             };
@@ -494,10 +542,16 @@ async fn run_command(cmd: Cmd) -> Result<()> {
         | Cmd::Servers
         | Cmd::Ui
         | Cmd::Daemon
+        | Cmd::Update { .. }
+        | Cmd::Review { .. }
+        | Cmd::Sync { .. }
+        | Cmd::UploadTest { .. }
         | Cmd::History { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. } => {
-            unreachable!("login/logout/servers/ui/daemon/history/pause/resume 已在 run() 中处理")
+            unreachable!(
+                "login/logout/servers/ui/daemon/update/review/sync/upload-test/history/pause/resume 已在 run() 中处理"
+            )
         }
     }
 
@@ -1007,7 +1061,12 @@ fn join_set(set: std::collections::BTreeSet<String>) -> String {
 }
 
 /// 为下载定位条目：--server > `名称:ID` > 在所有服务器上自动查找。
-async fn pick_item(cfg: &Config, server: Option<&str>, target: &str, limit: u32) -> Result<(Client, Item)> {
+async fn pick_item(
+    cfg: &Config,
+    server: Option<&str>,
+    target: &str,
+    limit: u32,
+) -> Result<(String, Client, Item)> {
     if cfg.is_empty() {
         bail!(
             "尚未登录任何服务器；请先运行 embydown login --server <URL> --user <账号> --password <密码>"
@@ -1019,7 +1078,7 @@ async fn pick_item(cfg: &Config, server: Option<&str>, target: &str, limit: u32)
             .with_context(|| format!("没有名为 {name} 的服务器；已登录：{}", cfg.name_list()))?;
         let client = client_for(name, profile).await?;
         match client.item(target).await {
-            Ok(item) => return Ok((client, item)),
+            Ok(item) => return Ok((name.to_string(), client, item)),
             Err(e) => {
                 util::vlog(1, format!("  ↳ {name} 上未找到 ID {target}，尝试按名称搜索…"));
                 util::vlog(2, format!("    {e:#}"));
@@ -1040,7 +1099,7 @@ async fn pick_item(cfg: &Config, server: Option<&str>, target: &str, limit: u32)
             .item(id)
             .await
             .with_context(|| format!("在 {prefix} 上获取条目 {id} 失败"))?;
-        return Ok((client, item));
+        return Ok((prefix.to_string(), client, item));
     }
 
     let mut clients = Vec::new();
@@ -1129,7 +1188,7 @@ fn choose_item(
     mut found: Vec<(String, Client, Item)>,
     target: &str,
     total_servers: usize,
-) -> Result<(Client, Item)> {
+) -> Result<(String, Client, Item)> {
     match found.len() {
         0 => bail!("所有服务器上都没找到 “{target}”"),
         1 => {
@@ -1139,7 +1198,7 @@ fn choose_item(
             } else {
                 util::vlog(1, format!("📡 自动选择服务器 {name}"));
             }
-            Ok((client, item))
+            Ok((name, client, item))
         }
         _ => {
             println!("“{target}” 在 {} 个服务器/条目中匹配：", found.len());
@@ -1183,7 +1242,7 @@ fn choose_item(
             )?;
             let (name, client, item) = found.remove(idx);
             println!("📡 已选择服务器 {name}");
-            Ok((client, item))
+            Ok((name, client, item))
         }
     }
 }

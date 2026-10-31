@@ -24,7 +24,7 @@ pub struct Client {
     pub insecure: bool,
 }
 
-/// 可序列化的连接参数：TUI 把下载任务交给后台守护进程时只传这些。
+/// 可序列化的连接参数：交互模式把下载任务交给后台守护进程时只传这些。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientCreds {
     pub server: String,
@@ -42,7 +42,7 @@ impl Client {
             .pool_max_idle_per_host(64)
             .connect_timeout(Duration::from_secs(20))
             // 服务端接受连接后不再发送数据时，read_timeout 会在每次读取超时后报错，
-            // 避免 probe/下载永久挂起（尤其是 TUI 里会永久占用并发槽位）。
+            // 避免 probe/下载永久挂起（尤其是交互模式里会永久占用并发槽位）。
             .read_timeout(Duration::from_secs(60))
             .build()
             .context("构建 HTTP 客户端失败")?;

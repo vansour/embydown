@@ -8,7 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// 同一进程内序列化写入（TUI 登录/删除 + 后台任务可能同时保存）。
+/// 同一进程内序列化写入（交互模式登录/删除 + 后台任务可能同时保存）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +26,13 @@ pub struct Profile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// TUI「设置」页的默认值；修改后自动保存。
-    pub out: String,
+    /// 交互模式「下载设置」的默认值；修改后自动保存。
+    /// 临时文件夹：下载先落到这里。
+    /// 旧配置里的 `out` 键会自动迁移到这个字段。
+    #[serde(alias = "out")]
+    pub temp_dir: String,
+    /// 最终文件夹：审查通过后用 `embydown sync` 复制到这里。
+    pub final_dir: String,
     pub connections: usize,
     pub jobs: usize,
     pub limit: String,
@@ -40,7 +45,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            out: "./downloads".into(),
+            temp_dir: "./downloads".into(),
+            final_dir: "./library".into(),
             connections: 2,
             jobs: 2,
             limit: String::new(),
@@ -57,7 +63,7 @@ pub struct Config {
     /// 别名 → 服务器配置。BTreeMap 保证输出顺序稳定。
     #[serde(default)]
     pub servers: BTreeMap<String, Profile>,
-    /// TUI 下载设置（输出目录、并发、限速等），与登录信息分开保存。
+    /// 交互模式下载设置（输出目录、并发、限速等），与登录信息分开保存。
     #[serde(default)]
     pub settings: Settings,
 }
@@ -192,7 +198,7 @@ fn load_from(path: &Path) -> Result<Option<Config>> {
 
 /// 原子地“读取 → 修改 → 保存”。
 ///
-/// load 和 save 之间如果被另一个进程（TUI 与 CLI 同时登录/删除）插入写入，
+/// load 和 save 之间如果被另一个进程（交互模式与 CLI 同时登录/删除）插入写入，
 /// 后保存的进程会用旧快照覆盖掉对方的改动。这里同时使用进程内互斥锁和
 /// 锁文件把整个读改写过程串行化。
 pub fn edit<T>(f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
@@ -377,21 +383,27 @@ mod tests {
     #[test]
     fn settings_round_trip_and_defaults_for_legacy_config() {
         let mut cfg = Config::default();
-        cfg.settings.out = "/media/downloads".into();
+        cfg.settings.temp_dir = "/media/downloads".into();
         cfg.settings.jobs = 4;
         cfg.settings.subs = false;
         let text = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.settings.out, "/media/downloads");
+        assert_eq!(back.settings.temp_dir, "/media/downloads");
         assert_eq!(back.settings.jobs, 4);
         assert!(!back.settings.subs);
 
         // 旧配置文件（只有 servers）读出来时，设置回落到默认值。
         let legacy: Config = serde_json::from_str(r#"{"servers":{}}"#).unwrap();
-        assert_eq!(legacy.settings.out, "./downloads");
+        assert_eq!(legacy.settings.temp_dir, "./downloads");
         assert_eq!(legacy.settings.connections, 2);
         assert_eq!(legacy.settings.jobs, 2);
         assert!(legacy.settings.resume);
+
+        // 旧配置里的 out 键迁移到 temp_dir。
+        let old_key: Config =
+            serde_json::from_str(r#"{"settings":{"out":"/old/downloads"}}"#).unwrap();
+        assert_eq!(old_key.settings.temp_dir, "/old/downloads");
+        assert_eq!(old_key.settings.final_dir, "./library");
     }
 
     #[test]

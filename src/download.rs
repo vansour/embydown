@@ -248,7 +248,7 @@ fn dest_lock(path: &Path) -> Arc<Mutex<()>> {
     let map = DEST_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
     if map.len() > 64 {
-        // 清理已经没人持有的路径锁，避免长时间运行的 TUI 无限增长。
+        // 清理已经没人持有的路径锁，避免长时间运行的交互模式 无限增长。
         map.retain(|_, lock| Arc::strong_count(lock) > 1);
     }
     map.entry(key)

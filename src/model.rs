@@ -31,7 +31,7 @@ pub struct Item {
     pub media_sources: Option<Vec<MediaSource>>,
     pub media_streams: Option<Vec<MediaStream>>,
     /// 非 API 字段：直接给一个 http(s) 直链时用它，跳过 URL 构造。
-    /// 这些字段需要随队列一起落盘（TUI 退出后由后台进程继续下载）。
+    /// 这些字段需要随队列一起落盘（交互模式退出后由后台进程继续下载）。
     #[serde(default)]
     pub direct_url: Option<String>,
     /// 非 API 字段：展开剧集时从 Series 容器/路径补全的剧集年份
@@ -181,6 +181,32 @@ impl Item {
         }
 
         score
+    }
+
+    /// 搜索结果的聚合键：同一部影片 / 同一集在不同服务器上应得到相同键。
+    ///
+    /// 用于「先选影片、再选来源」：标题比较前会去掉空格和标点，
+    /// 剧集按「剧名 + 季 + 集」聚合（各服务器的单集标题常不一致），
+    /// 电影等按「类型 + 标题 + 年份」聚合，同名不同年的翻拍片不会被合并。
+    pub fn search_group_key(&self) -> String {
+        let kind = self.item_type.as_deref().unwrap_or("item");
+        if kind == "Episode" {
+            let series = normalize_search(self.series_name.as_deref().unwrap_or_default());
+            let episode = self.episode_no();
+            if !series.is_empty() && episode > 0 {
+                return format!("episode:{series}:{}:{episode}", self.season_no());
+            }
+        }
+        let title = normalize_search(&self.title());
+        // 剧集的年份在不同服务器上可能是首播年/发行年，差异较大；
+        // 同名翻拍剧很少见，因此剧集只按标题聚合，避免同一部剧被拆成两组。
+        if kind == "Series" {
+            return format!("series:{title}");
+        }
+        match self.production_year.filter(|y| *y >= 1800) {
+            Some(year) => format!("{kind}:{title}:{year}"),
+            None => format!("{kind}:{title}"),
+        }
     }
 
     pub fn season_no(&self) -> i32 {
@@ -414,5 +440,68 @@ mod tests {
             ..Default::default()
         };
         assert!(item.search_score("庆余年") > 0);
+    }
+
+    #[test]
+    fn search_group_key_matches_movie_across_servers() {
+        let a = Item {
+            name: Some("Spider-Man: No Way Home".into()),
+            item_type: Some("Movie".into()),
+            production_year: Some(2021),
+            ..Default::default()
+        };
+        let b = Item {
+            name: Some("spider man no way home".into()),
+            item_type: Some("Movie".into()),
+            production_year: Some(2021),
+            ..Default::default()
+        };
+        assert_eq!(a.search_group_key(), b.search_group_key());
+
+        let remake = Item {
+            production_year: Some(1999),
+            ..a.clone()
+        };
+        assert_ne!(a.search_group_key(), remake.search_group_key());
+
+        // 剧集不按年份拆分：不同服务器的首播/发行年可能不同。
+        let series_a = Item {
+            name: Some("庆余年".into()),
+            item_type: Some("Series".into()),
+            production_year: Some(2019),
+            ..Default::default()
+        };
+        let series_b = Item {
+            production_year: Some(2020),
+            ..series_a.clone()
+        };
+        assert_eq!(series_a.search_group_key(), series_b.search_group_key());
+    }
+
+    #[test]
+    fn search_group_key_uses_series_season_episode_for_episodes() {
+        let a = Item {
+            name: Some("第一集".into()),
+            item_type: Some("Episode".into()),
+            series_name: Some("庆余年".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        let b = Item {
+            name: Some("Episode 1".into()),
+            item_type: Some("Episode".into()),
+            series_name: Some("庆 余年".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(a.search_group_key(), b.search_group_key());
+
+        let next = Item {
+            index_number: Some(2),
+            ..a.clone()
+        };
+        assert_ne!(a.search_group_key(), next.search_group_key());
     }
 }
