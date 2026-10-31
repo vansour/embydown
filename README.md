@@ -395,14 +395,14 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 
 版本号在 `Cargo.toml`，变更记录见 [CHANGELOG.md](CHANGELOG.md)；推送 `v*` 标签会触发 `.github/workflows/release.yml`：
 
-- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.4` 对应版本 `0.0.4`）
+- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.5` 对应版本 `0.0.5`）
 - 构建 x86_64 release，打包二进制、README、CHANGELOG 和 install.sh，生成 SHA-256
 - 同时上传裸二进制（`embydown-vX.Y.Z-x86_64-unknown-linux-gnu.bin` 与稳定别名）供 `embydown update` 使用
 - 创建 GitHub Release 并上传产物
 
 ```bash
-git tag v0.0.4
-git push origin v0.0.4
+git tag v0.0.5
+git push origin v0.0.5
 ```
 
 `main` 分支的 push / PR 会运行 `.github/workflows/ci.yml`（clippy、测试、release 构建）。
