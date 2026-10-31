@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -100,9 +101,83 @@ impl FolderReport {
     }
 }
 
+#[derive(Clone)]
 struct PlanFile {
     rel: PathBuf,
     size: u64,
+}
+
+/// 差异列表的一行：同一季的剧集合并成一行，其它文件逐条显示。
+struct DisplayRow {
+    /// `(剧名, 季)`；`None` 表示电影/字幕等非剧集文件。
+    group: Option<(String, i32)>,
+    files: Vec<PlanFile>,
+}
+
+/// 按「剧名 + 季」聚合差异文件，保持首次出现顺序。
+fn group_plan_files(files: &[PlanFile]) -> Vec<DisplayRow> {
+    let mut rows: Vec<DisplayRow> = Vec::new();
+    let mut index: HashMap<(String, i32), usize> = HashMap::new();
+    for file in files {
+        let key = match parse_episode(&file.rel) {
+            (Some(series), Some(season), _) => Some((series, season)),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if let Some(&row) = index.get(&key) {
+                rows[row].files.push(file.clone());
+            } else {
+                index.insert(key.clone(), rows.len());
+                rows.push(DisplayRow {
+                    group: Some(key),
+                    files: vec![file.clone()],
+                });
+            }
+        } else {
+            rows.push(DisplayRow {
+                group: None,
+                files: vec![file.clone()],
+            });
+        }
+    }
+    // 目录遍历顺序不保证稳定；按相对路径排序，输出可重复。
+    rows.sort_by(|a, b| a.files[0].rel.cmp(&b.files[0].rel));
+    rows
+}
+
+/// 渲染差异列表；`-v` 时展开为逐个文件。
+fn render_plan_rows(rows: &[DisplayRow], verbose: bool) -> Vec<String> {
+    if verbose {
+        return rows
+            .iter()
+            .flat_map(|row| row.files.iter())
+            .map(|file| format!("{}（{}）", file.rel.display(), format_bytes(file.size)))
+            .collect();
+    }
+    rows.iter()
+        .map(|row| match &row.group {
+            Some((series, season)) if row.files.len() > 1 => {
+                let bytes: u64 = row.files.iter().map(|file| file.size).sum();
+                format!(
+                    "{series} S{season:02}（{} 集，{}）",
+                    row.files.len(),
+                    format_bytes(bytes)
+                )
+            }
+            Some((series, season)) => {
+                let file = &row.files[0];
+                let episode = parse_episode(&file.rel).2.unwrap_or(0);
+                format!(
+                    "{series} S{season:02}E{episode:02}（{}）",
+                    format_bytes(file.size)
+                )
+            }
+            None => {
+                let file = &row.files[0];
+                format!("{}（{}）", file.rel.display(), format_bytes(file.size))
+            }
+        })
+        .collect()
 }
 
 struct SyncPlan {
@@ -178,8 +253,8 @@ pub fn sync(
     let bar = progress_bar(plan.copy_bytes);
     let mut copied = 0usize;
     let mut copied_bytes = 0u64;
-    let mut failures = Vec::new();
-    for file in files {
+    let mut failures: Vec<(&PlanFile, anyhow::Error)> = Vec::new();
+    for file in &files {
         if let Some(bar) = &bar {
             bar.set_message(file.rel.display().to_string());
         }
@@ -193,9 +268,50 @@ pub fn sync(
                 copied += 1;
                 copied_bytes += file.size;
             }
-            Err(e) => failures.push(format!("{}: {e:#}", file.rel.display())),
+            Err(e) => failures.push((file, e)),
         }
     }
+
+    // 网盘/FUSE 挂载的临时错误（超时、ENOTRECOVERABLE 等）往往几十秒内恢复。
+    // 主流程结束后自动重试一次，避免用户手动重跑整个同步。
+    if !failures.is_empty() {
+        let (retry, permanent): (Vec<_>, Vec<_>) = failures
+            .into_iter()
+            .partition(|(_, error)| is_transient_error(error));
+        if !retry.is_empty() {
+            println!(
+                "\n! {} 个文件因网盘/云端临时错误失败，5 秒后自动重试…",
+                retry.len()
+            );
+            std::thread::sleep(Duration::from_secs(5));
+            if let Some(bar) = &bar {
+                bar.set_position(copied_bytes);
+            }
+            let mut still_failed = Vec::new();
+            for (file, _) in retry {
+                if let Some(bar) = &bar {
+                    bar.set_message(format!("重试 {}", file.rel.display()));
+                }
+                match copy_atomic(
+                    &temp.join(&file.rel),
+                    &final_dir.join(&file.rel),
+                    file.size,
+                    bar.as_ref(),
+                ) {
+                    Ok(()) => {
+                        copied += 1;
+                        copied_bytes += file.size;
+                    }
+                    Err(e) => still_failed.push((file, e)),
+                }
+            }
+            failures = permanent;
+            failures.extend(still_failed);
+        } else {
+            failures = permanent;
+        }
+    }
+
     if let Some(bar) = bar {
         bar.finish_and_clear();
     }
@@ -206,12 +322,41 @@ pub fn sync(
     );
     if !failures.is_empty() {
         println!("✗ 失败 {} 个：", failures.len());
-        for failure in &failures {
-            println!("   - {failure}");
+        for (file, error) in &failures {
+            println!(
+                "   - {}: {}",
+                file.rel.display(),
+                crate::emby::redact_text(&format!("{error:#}"))
+            );
+        }
+        if failures.iter().any(|(_, error)| is_transient_error(error)) {
+            println!(
+                "\n  ! 网盘/云端暂时不可用。挂载恢复后重新运行 `embydown sync` 即可，只会复制缺失文件。"
+            );
         }
         bail!("{} 个文件同步失败", failures.len());
     }
     Ok(())
+}
+
+/// 网盘挂载/CDN 常见的临时错误：稍后重试即可恢复。
+fn is_transient_io(error: &std::io::Error) -> bool {
+    // EINTR / EIO / EAGAIN / EBUSY / ETIMEDOUT / EREMOTEIO / ENOTRECOVERABLE
+    matches!(
+        error.raw_os_error(),
+        Some(4 | 5 | 11 | 16 | 110 | 121 | 131)
+    ) || matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn is_transient_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(is_transient_io))
 }
 
 fn resolve_dirs(
@@ -693,7 +838,10 @@ fn print_items(items: &[String], prefix: &str) {
         println!("    {prefix}{item}");
     }
     if items.len() > limit {
-        println!("    … 还有 {} 项（加 -v 查看全部）", items.len() - limit);
+        println!(
+            "    … 还有 {} 项（加 -v 展开全部文件）",
+            items.len() - limit
+        );
     }
 }
 
@@ -768,11 +916,8 @@ fn print_plan(plan: &SyncPlan, preview: bool) {
             plan.to_copy.len(),
             format_bytes(plan.to_copy.iter().map(|file| file.size).sum())
         );
-        let items: Vec<String> = plan
-            .to_copy
-            .iter()
-            .map(|file| format!("{}（{}）", file.rel.display(), format_bytes(file.size)))
-            .collect();
+        let items =
+            render_plan_rows(&group_plan_files(&plan.to_copy), verbose() >= 1);
         print_items(&items, "- ");
         if !plan.overwrite.is_empty() {
             println!(
@@ -780,11 +925,8 @@ fn print_plan(plan: &SyncPlan, preview: bool) {
                 plan.overwrite.len(),
                 format_bytes(plan.overwrite.iter().map(|file| file.size).sum())
             );
-            let items: Vec<String> = plan
-                .overwrite
-                .iter()
-                .map(|file| format!("{}（{}）", file.rel.display(), format_bytes(file.size)))
-                .collect();
+            let items =
+                render_plan_rows(&group_plan_files(&plan.overwrite), verbose() >= 1);
             print_items(&items, "- ");
         }
     }
@@ -795,11 +937,8 @@ fn print_plan(plan: &SyncPlan, preview: bool) {
             plan.final_only.len(),
             format_bytes(plan.final_only.iter().map(|file| file.size).sum())
         );
-        let items: Vec<String> = plan
-            .final_only
-            .iter()
-            .map(|file| file.rel.display().to_string())
-            .collect();
+        let items =
+            render_plan_rows(&group_plan_files(&plan.final_only), verbose() >= 1);
         print_items(&items, "- ");
     }
     if !plan.skipped.is_empty() {
@@ -833,6 +972,24 @@ fn progress_bar(total: u64) -> Option<ProgressBar> {
     Some(bar)
 }
 
+/// 创建目标目录；FUSE/网盘挂载偶尔会返回可恢复的临时错误，短退避后重试。
+fn create_parent_dirs(parent: &Path) -> Result<()> {
+    let mut delay = Duration::from_millis(500);
+    for attempt in 0..3 {
+        match fs::create_dir_all(parent) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < 2 && is_transient_io(&error) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("创建目录失败：{}", parent.display()));
+            }
+        }
+    }
+    unreachable!("重试循环最多执行三次")
+}
+
 fn copy_atomic(
     src: &Path,
     dest: &Path,
@@ -842,7 +999,7 @@ fn copy_atomic(
     let parent = dest
         .parent()
         .with_context(|| format!("无法确定目标目录：{}", dest.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("创建目录失败：{}", parent.display()))?;
+    create_parent_dirs(parent)?;
     let name = dest
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -973,6 +1130,47 @@ mod tests {
         let (kind, error) = classify_and_check(Path::new("movie.mkv.part"), 0);
         assert_eq!(kind, Kind::Incomplete);
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn groups_plan_files_by_series_and_season() {
+        let file = |rel: &str, size: u64| PlanFile {
+            rel: PathBuf::from(rel),
+            size,
+        };
+        let files = vec![
+            file("影视/剧集/某剧 (2020)/Season 00001/某剧 - S00001E00002.mkv", 100),
+            file("影视/剧集/某剧 (2020)/Season 00001/某剧 - S00001E00001.mkv", 50),
+            file("影视/电影/某电影 (2019)/某电影.mkv", 200),
+        ];
+        let rows = group_plan_files(&files);
+        assert_eq!(rows.len(), 2);
+        let series = rows.iter().find(|row| row.group.is_some()).unwrap();
+        assert_eq!(series.files.len(), 2);
+        assert_eq!(series.group.as_ref().unwrap().0, "某剧");
+        assert_eq!(series.group.as_ref().unwrap().1, 1);
+
+        let lines = render_plan_rows(&rows, false);
+        assert!(lines.iter().any(|line| line == "某剧 S01（2 集，150 B）"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("某电影 (2019)/某电影.mkv"))
+        );
+
+        let expanded = render_plan_rows(&rows, true);
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[test]
+    fn classifies_transient_mount_errors() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(131))
+            .context("创建目录失败");
+        assert!(is_transient_error(&error));
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(110));
+        assert!(is_transient_error(&error));
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(2));
+        assert!(!is_transient_error(&error));
     }
 
     #[test]
