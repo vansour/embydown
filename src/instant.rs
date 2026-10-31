@@ -27,7 +27,9 @@ const EXDEV: i32 = 18;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    pub cd2: cd2::Config,
+    /// 命令行显式覆盖；None/空表示使用环境变量或配置文件。
+    pub cd2_url: Option<String>,
+    pub cd2_token: Option<String>,
     /// 观察上传任务的时间窗口。
     pub window: Duration,
     /// 保留最终文件夹中的测试目录（默认测试后删除）。
@@ -39,7 +41,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            cd2: cd2::Config::default(),
+            cd2_url: None,
+            cd2_token: None,
             window: Duration::from_secs(20),
             keep: false,
             temp_dir: None,
@@ -127,8 +130,14 @@ pub async fn run_item(
         .unwrap_or_else(|| "test-file".into());
 
     // 先确认 CD2 API 可用，避免白白下载一集。
-    println!("\n正在连接 CD2：{}", options.cd2.url);
-    let cd2_client = cd2::Client::new(&options.cd2)?;
+    let cd2_config = cd2::Config::resolve(
+        options.cd2_url.as_deref(),
+        options.cd2_token.as_deref(),
+        &settings.cd2_url,
+        &settings.cd2_token,
+    );
+    println!("\n正在连接 CD2：{}", cd2_config.url);
+    let cd2_client = cd2::Client::new(&cd2_config)?;
     let before = cd2_client
         .upload_tasks()
         .await

@@ -98,10 +98,8 @@ async fn run(cli: Cli) -> Result<()> {
                 server.server.as_deref(),
                 limit,
                 instant::Options {
-                    cd2: cd2::Config {
-                        url: cd2_url,
-                        token: cd2_token,
-                    },
+                    cd2_url,
+                    cd2_token,
                     window: std::time::Duration::from_secs(window.max(1)),
                     keep,
                     temp_dir: temp,

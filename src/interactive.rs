@@ -306,14 +306,19 @@ impl App {
                 .with_context(|| format!("服务器 {server} 未连接"))?
         };
 
-        let cd2 = crate::cd2::Config::default();
+        let cd2 = crate::cd2::Config::resolve(
+            None,
+            None,
+            &self.cfg.settings.cd2_url,
+            &self.cfg.settings.cd2_token,
+        );
         println!();
         print_key_value("服务器", &server);
         print_key_value("CD2 API", &cd2.url);
         if cd2.token.is_none() {
             println!(
                 "  {}",
-                dim("未设置 CD2 令牌；如果 CD2 开启鉴权，请先设置 CLOUDDRIVE_API_TOKEN。")
+                dim("未设置 CD2 令牌；可在「下载设置」中填写，或设置 CLOUDDRIVE_API_TOKEN。")
             );
         }
         if !confirm("开始秒传测试？", true)? {
@@ -322,7 +327,8 @@ impl App {
         }
         let keep = confirm("测试后保留最终文件夹中的测试目录？", false)?;
         let options = crate::instant::Options {
-            cd2,
+            cd2_url: None,
+            cd2_token: None,
             window: Duration::from_secs(20),
             keep,
             temp_dir: None,
@@ -905,6 +911,16 @@ impl App {
             } else {
                 truncate_display(s.pattern.trim(), 48)
             };
+            let cd2_url = if s.cd2_url.trim().is_empty() {
+                "默认（http://127.0.0.1:19798）".to_string()
+            } else {
+                truncate_display(s.cd2_url.trim(), 48)
+            };
+            let cd2_token = if s.cd2_token.trim().is_empty() {
+                "未设置".to_string()
+            } else {
+                "已设置".to_string()
+            };
             let rows = [
                 ("1", "临时文件夹（下载目录）", temp.to_string()),
                 ("2", "最终文件夹（同步目标）", final_dir.to_string()),
@@ -915,13 +931,18 @@ impl App {
                 ("7", "覆盖已存在文件", on_off(s.overwrite).to_string()),
                 ("8", "断点续传", on_off(s.resume).to_string()),
                 ("9", "命名模板", pattern),
+                ("10", "CD2 地址（秒传测试）", cd2_url),
+                ("11", "CD2 API 令牌", cd2_token),
             ];
             let mut table = Table::new(&["#", "设置项", "当前值"]).align(0, Align::Right);
             for (key, name, value) in rows {
                 table.row(vec![key.to_string(), name.to_string(), value]);
             }
             println!("{}", table.render());
-            println!("  {}", dim("修改后立即保存到配置文件。"));
+            println!(
+                "  {}",
+                dim("修改后立即保存。CD2 参数优先级：命令行/环境变量 > 此处设置 > 默认。")
+            );
             print_options(&[("0)", "返回")]);
 
             let Some(choice) = prompt("选择要修改的项：")? else {
@@ -978,6 +999,30 @@ impl App {
                     if let Some(value) = prompt("新的命名模板（留空=内置默认；回车取消）：")?
                     {
                         self.update_settings(|s| s.pattern = value);
+                    }
+                }
+                "10" => {
+                    if let Some(value) =
+                        prompt("新的 CD2 地址（输入 - 恢复默认，回车取消）：")?
+                    {
+                        let value = value.trim();
+                        if value == "-" {
+                            self.update_settings(|s| s.cd2_url.clear());
+                        } else if !value.is_empty() {
+                            self.update_settings(|s| s.cd2_url = value.to_string());
+                        }
+                    }
+                }
+                "11" => {
+                    if let Some(value) =
+                        read_secret("新的 CD2 API 令牌（输入 - 清除，回车取消）：")?
+                    {
+                        let value = value.trim();
+                        if value == "-" {
+                            self.update_settings(|s| s.cd2_token.clear());
+                        } else if !value.is_empty() {
+                            self.update_settings(|s| s.cd2_token = value.to_string());
+                        }
                     }
                 }
                 "0" | "q" | "" => return Ok(()),

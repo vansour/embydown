@@ -132,12 +132,12 @@ pub enum Cmd {
         #[arg(long, default_value_t = 30)]
         limit: u32,
 
-        /// CD2 gRPC 地址
-        #[arg(long, env = "CD2_URL", default_value = "http://127.0.0.1:19798")]
-        cd2_url: String,
+        /// CD2 地址：原生 gRPC（http://host:19798）或 CD2 Web UI/API 地址（自动使用 gRPC-Web）
+        #[arg(long, value_name = "URL")]
+        cd2_url: Option<String>,
 
-        /// CD2 API 令牌（也可设置 CLOUDDRIVE_API_TOKEN）
-        #[arg(long, env = "CLOUDDRIVE_API_TOKEN")]
+        /// CD2 API 令牌（默认使用配置中的令牌或 CLOUDDRIVE_API_TOKEN）
+        #[arg(long, value_name = "TOKEN")]
         cd2_token: Option<String>,
 
         /// 观察 CD2 上传任务的秒数

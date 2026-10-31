@@ -3,6 +3,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.5` ↔ `0.0.5`）。
 
+## [未发布]
+
+### 新增
+
+- 「下载设置」新增 CD2 gRPC 地址与 API 令牌，持久化到 `config.json`（权限 0600）；
+  秒传测试按「命令行参数 > 环境变量 > 下载设置 > 默认地址」的顺序解析 CD2 参数。
+
+### 修复
+
+- 秒传测试连接 CD2 Web UI/反向代理地址时，原生 gRPC 会被 nginx 拒绝（HTTP 400）。
+  现在会自动回退到 gRPC-Web（`application/grpc-web+proto`），可直接使用
+  `https://clouddrive2.example.com/` 这类 Web UI 地址，并正确显示 API 令牌错误。
+
 ## [0.0.5] - 2026-10-31
 
 ### 新增

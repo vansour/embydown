@@ -105,16 +105,47 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            url: std::env::var("CD2_URL")
-                .ok()
-                .filter(|url| !url.trim().is_empty())
-                .unwrap_or_else(|| "http://127.0.0.1:19798".to_string()),
-            token: std::env::var("CLOUDDRIVE_API_TOKEN")
-                .ok()
-                .or_else(|| std::env::var("CD2_TOKEN").ok())
-                .filter(|token| !token.trim().is_empty()),
-        }
+        Self::resolve(None, None, "", "")
+    }
+}
+
+impl Config {
+    /// 解析 CD2 配置，优先级：显式参数 > 环境变量 > 配置文件 > 默认值。
+    pub fn resolve(
+        url_override: Option<&str>,
+        token_override: Option<&str>,
+        settings_url: &str,
+        settings_token: &str,
+    ) -> Self {
+        let explicit_url = url_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let env_url = std::env::var("CD2_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let settings_url = settings_url.trim();
+        let url = explicit_url
+            .map(str::to_string)
+            .or(env_url)
+            .or_else(|| (!settings_url.is_empty()).then(|| settings_url.to_string()))
+            .unwrap_or_else(|| "http://127.0.0.1:19798".to_string());
+
+        let explicit_token = token_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let env_token = std::env::var("CLOUDDRIVE_API_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("CD2_TOKEN").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let settings_token = settings_token.trim();
+        let token = explicit_token
+            .map(str::to_string)
+            .or(env_token)
+            .or_else(|| (!settings_token.is_empty()).then(|| settings_token.to_string()));
+
+        Self { url, token }
     }
 }
 
@@ -144,7 +175,30 @@ impl Client {
     }
 
     /// 读取完整的上传任务列表（包括已经完成/跳过的任务）。
+    ///
+    /// 先尝试原生 gRPC（本地 19798 端口）；如果地址是 CD2 Web UI 的
+    /// nginx 反代（只支持 gRPC-Web），会自动回退到
+    /// `application/grpc-web+proto`。
     pub async fn upload_tasks(&self) -> Result<Vec<UploadTask>> {
+        match self.upload_tasks_native().await {
+            Ok(tasks) => Ok(tasks),
+            Err(native_error) => {
+                // 原生 gRPC 已经连上但鉴权失败时，不需要再试 Web UI。
+                if native_error.to_string().contains("拒绝访问") {
+                    return Err(native_error);
+                }
+                match self.upload_tasks_web().await {
+                    Ok(tasks) => Ok(tasks),
+                    Err(web_error) => Err(anyhow::anyhow!(
+                        "CD2 原生 gRPC 失败：{native_error:#}\n\
+                         CD2 gRPC-Web 失败：{web_error:#}"
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn upload_tasks_native(&self) -> Result<Vec<UploadTask>> {
         let endpoint = format!(
             "{}/clouddrive.CloudDriveFileSrv/GetUploadFileList",
             self.url
@@ -186,14 +240,7 @@ impl Client {
         if let Some(status) = &grpc_status
             && status != "0"
         {
-            let message = grpc_message.unwrap_or_default();
-            if status == "16" || message.to_ascii_lowercase().contains("unauthent") {
-                bail!(
-                    "CD2 拒绝访问（需要 API 令牌）：请在 CD2「设置 → API 令牌」创建令牌，\
-                     然后设置 CLOUDDRIVE_API_TOKEN 或使用 --cd2-token"
-                );
-            }
-            bail!("CD2 gRPC 错误 {status}：{message}");
+            return Err(grpc_error(status, &grpc_message.unwrap_or_default()));
         }
         if body.is_empty() {
             bail!(
@@ -204,6 +251,147 @@ impl Client {
         let message = grpc_unwrap(&body)?;
         parse_upload_list(message)
     }
+
+    async fn upload_tasks_web(&self) -> Result<Vec<UploadTask>> {
+        let endpoint = format!(
+            "{}/clouddrive.CloudDriveFileSrv/GetUploadFileList",
+            self.url
+        );
+        let mut request = self
+            .http
+            .post(&endpoint)
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .header("x-user-agent", "grpc-web-javascript/0.1")
+            .header("accept", "application/grpc-web+proto")
+            .header("te", "trailers")
+            .header("user-agent", concat!("embydown/", env!("CARGO_PKG_VERSION")))
+            .body(grpc_envelope(&encode_upload_request()));
+        if let Some(token) = &self.token {
+            request = request.header("authorization", format!("Bearer {}", token.trim()));
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("连接 CD2 gRPC-Web 失败：{endpoint}"))?;
+        let http_status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let header_status = response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let header_message = response
+            .headers()
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok())
+            .map(percent_decode);
+        let body = response
+            .bytes()
+            .await
+            .context("读取 CD2 gRPC-Web 响应失败")?;
+
+        if !http_status.is_success() {
+            bail!("CD2 gRPC-Web 返回 HTTP {http_status}（content-type: {content_type}）");
+        }
+        if content_type.starts_with("application/grpc-web-text") {
+            bail!("CD2 返回 gRPC-Web text 响应，当前版本只支持 application/grpc-web+proto");
+        }
+
+        let parsed = parse_web_response(&body)?;
+        let status = parsed.status.or(header_status);
+        let message_text = parsed
+            .message_text
+            .or(header_message)
+            .unwrap_or_default();
+        if let Some(status) = status
+            && status != "0"
+        {
+            return Err(grpc_error(&status, &message_text));
+        }
+        let Some(message) = parsed.message else {
+            bail!(
+                "CD2 gRPC-Web 返回空响应；请确认地址是 CD2 Web UI/API 地址，\
+                 且 API 令牌有「读取任务」权限"
+            );
+        };
+        parse_upload_list(message)
+    }
+}
+
+fn grpc_error(status: &str, message: &str) -> anyhow::Error {
+    let lowered = message.to_ascii_lowercase();
+    if status == "16" || lowered.contains("unauthent") || lowered.contains("auth token") {
+        anyhow::anyhow!(
+            "CD2 拒绝访问（需要 API 令牌）：{message}\n\
+             请在 CD2「设置 → API 令牌」创建令牌，并填写到「下载设置」或 CLOUDDRIVE_API_TOKEN"
+        )
+    } else {
+        anyhow::anyhow!("CD2 gRPC 错误 {status}：{message}")
+    }
+}
+
+struct WebResponse<'a> {
+    message: Option<&'a [u8]>,
+    status: Option<String>,
+    message_text: Option<String>,
+}
+
+fn parse_web_response(body: &[u8]) -> Result<WebResponse<'_>> {
+    let mut position = 0usize;
+    let mut response = WebResponse {
+        message: None,
+        status: None,
+        message_text: None,
+    };
+    while position < body.len() {
+        if body.len() - position < 5 {
+            bail!("CD2 gRPC-Web 响应被截断");
+        }
+        let flags = body[position];
+        let length = u32::from_be_bytes([
+            body[position + 1],
+            body[position + 2],
+            body[position + 3],
+            body[position + 4],
+        ]) as usize;
+        position += 5;
+        let end = position
+            .checked_add(length)
+            .context("CD2 gRPC-Web 响应长度溢出")?;
+        if end > body.len() {
+            bail!("CD2 gRPC-Web 响应被截断");
+        }
+        let payload = &body[position..end];
+        position = end;
+
+        if flags & 0x80 != 0 {
+            let text = String::from_utf8_lossy(payload);
+            for line in text.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "grpc-status" => response.status = Some(value.trim().to_string()),
+                    "grpc-message" => {
+                        response.message_text = Some(percent_decode(value.trim()));
+                    }
+                    _ => {}
+                }
+            }
+        } else if flags & 0x01 != 0 {
+            bail!("CD2 gRPC-Web 响应启用了压缩，当前版本不支持");
+        } else if response.message.is_none() {
+            response.message = Some(payload);
+        }
+    }
+    Ok(response)
 }
 
 fn normalize_url(url: &str) -> String {
@@ -482,5 +670,21 @@ mod tests {
         body.extend_from_slice(message);
         assert_eq!(grpc_unwrap(&body).unwrap(), message);
         assert!(grpc_unwrap(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn parses_grpc_web_frames() {
+        let mut body = vec![0, 0, 0, 0, 3];
+        body.extend_from_slice(b"abc");
+        // trailers frame: flags 0x80, length, grpc-status
+        let trailer = b"grpc-status: 0\r\ngrpc-message: ok\r\n";
+        body.push(0x80);
+        body.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+        body.extend_from_slice(trailer);
+
+        let parsed = parse_web_response(&body).unwrap();
+        assert_eq!(parsed.message, Some(&b"abc"[..]));
+        assert_eq!(parsed.status.as_deref(), Some("0"));
+        assert_eq!(parsed.message_text.as_deref(), Some("ok"));
     }
 }

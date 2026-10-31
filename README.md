@@ -94,7 +94,7 @@ embydown ui           # 等价写法（也可以写 embydown interactive）
 | 2 浏览媒体库 | 服务器 → 媒体库 → 剧集 / 季 / 分集逐层浏览，选中条目下载；`d` 下载当前目录 |
 | 3 下载队列 | 每个服务器一条独立下载流，显示进度、排队、完成/失败统计；可暂停/继续、取消、清空记录 |
 | 4 服务器管理 | 添加登录（账号密码 / API Key）、删除、设置搜索范围 |
-| 5 下载设置 | 临时文件夹、最终文件夹、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
+| 5 下载设置 | 临时文件夹、最终文件夹、CD2 地址/令牌、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
 | 6 未完成任务找回 | 递归扫描 `.part` / `.part.json`，搜索来源并写回原路径续传 |
 | 7 下载记录 | 查看历史记录（最新在前） |
 | 8 本地审查 | 检查临时/最终文件夹的内容、缺集、损坏文件与同步差异 |
@@ -200,15 +200,29 @@ FUSE 返回成功并不代表云端已经收到文件，所以不能靠写入耗
 gRPC 上传任务（`GetUploadFileList`），观察该文件的 `status` 与 `transferredBytes`：
 
 ```bash
-# 先让 embydown 连接 CD2（默认 http://127.0.0.1:19798）
+# 方式一：在交互模式「下载设置」第 10/11 项填写 CD2 地址和 API 令牌
+# 会持久化到 ~/.config/embydown/config.json（权限 0600）
+
+# 方式二：环境变量
 export CD2_URL=http://127.0.0.1:19798
 export CLOUDDRIVE_API_TOKEN=你的令牌   # CD2「设置 → API 令牌」
+
+# 方式三：命令行参数
+embydown upload-test "剧名" --server media.micu.hk \
+  --cd2-url http://127.0.0.1:19798 --cd2-token 你的令牌
 
 # 只下载第一集并测试；--window 控制观察上传任务的秒数
 embydown upload-test "剧名" --server media.micu.hk
 embydown upload-test <SERIES_ID> --window 30
 embydown upload-test <SERIES_ID> --keep     # 保留最终文件夹里的测试目录
 ```
+
+优先级：`--cd2-url/--cd2-token` > `CD2_URL`/`CLOUDDRIVE_API_TOKEN` > 下载设置 > 默认地址。
+
+- CD2 地址可以是原生 gRPC（`http://host:19798`），也可以是 CD2 Web UI/API 域名；
+  后者会自动改用 gRPC-Web（`application/grpc-web+proto`），不需要额外配置原生 gRPC 反代
+- 令牌需在 CD2「设置 → API 令牌」创建；没有令牌时 Web UI 会返回
+  `No valid auth token`
 
 - 在最终文件夹下创建一次性测试目录（`_embydown_instant_test_*`），**不会覆盖真实媒体库**
 - 剧集自动选择第一集（常规季优先于特别篇）；同一集有多个版本时选体积最大的
