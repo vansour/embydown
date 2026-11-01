@@ -226,7 +226,7 @@ impl App {
                 "6" => run_step(self.unfinished_menu()).await,
                 "7" => run_step(self.history_menu()).await,
                 "8" => {
-                    if let Err(e) = crate::review::run(None, None) {
+                    if let Err(e) = crate::review::run(None, None, false) {
                         println!(
                             "{} {}",
                             red("✗"),

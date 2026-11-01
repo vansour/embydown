@@ -97,6 +97,10 @@ pub enum Cmd {
         /// 最终文件夹（默认使用配置中的最终文件夹）
         #[arg(long = "final", value_name = "DIR")]
         final_dir: Option<PathBuf>,
+
+        /// 额外读取最终端临时文件所在目录的直属文件（只读结构、不读大小；不遍历整棵媒体树）
+        #[arg(long)]
+        full: bool,
     },
 
     /// 将临时文件夹的内容同步（复制）到最终文件夹

@@ -1,13 +1,17 @@
 //! 本地审查与临时 → 最终文件夹同步。
 //!
 //! 审查在本地完成，不访问服务器，也不打开文件读取内容：
-//! - 只依据目录项（文件名/路径与大小）统计视频/字幕/元数据/图片与总大小；
+//! - 临时文件夹：依据目录项（文件名/路径与大小）统计视频/字幕/元数据/图片与总大小；
+//! - 最终文件夹：默认只检查临时文件夹中出现的文件在目标端是否存在、大小是否一致，
+//!   不扫描整个目录（网盘/分享目录的 readdir 可能极慢）；`review --full` 时也只读
+//!   临时文件所在目录的直属文件，不遍历整棵媒体树，且不读取文件大小。
 //! - 按 `SxxExx` 识别剧集，检查集号连续性（缺集）与重复集；
 //! - 检查空文件、过小视频与 `.part` 等未完成文件；
-//! - 对比临时/最终文件夹，列出待复制、待覆盖、仅最终有等差异。
+//! - 对比临时/最终文件夹，列出待复制、待覆盖等差异；`--full` 时额外列出仅最终有的文件。
 //!
 //! 同步默认只复制缺失文件和大小不一致的文件；`.part`、异常文件会被跳过，
-//! 最终文件夹里多出来的文件不会被删除。
+//! 最终文件夹里多出来的文件不会被删除。同步只按待复制文件逐个检查最终路径，
+//! 不递归扫描最终文件夹——网盘挂载上的无关目录（如分享目录）可能极慢。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -37,7 +41,8 @@ enum Kind {
 #[derive(Clone)]
 struct FileEntry {
     rel: PathBuf,
-    size: u64,
+    /// `None` 表示只扫描了目录结构，没有读取文件大小。
+    size: Option<u64>,
     kind: Kind,
     error: Option<String>,
     series: Option<String>,
@@ -56,7 +61,8 @@ struct FolderReport {
     exists: bool,
     files: Vec<FileEntry>,
     scan_errors: Vec<String>,
-    total_size: u64,
+    /// `None` 表示没有读取文件大小（只扫描了目录结构）。
+    total_size: Option<u64>,
     videos: usize,
     episodes: usize,
     movies: usize,
@@ -68,7 +74,7 @@ struct FolderReport {
     other: usize,
     series_seasons: BTreeMap<(String, i32), SeasonStats>,
     movie_names: BTreeSet<String>,
-    incomplete_files: BTreeMap<PathBuf, u64>,
+    incomplete_files: BTreeMap<PathBuf, Option<u64>>,
 }
 
 impl FolderReport {
@@ -78,7 +84,7 @@ impl FolderReport {
             exists,
             files: Vec::new(),
             scan_errors: Vec::new(),
-            total_size: 0,
+            total_size: None,
             videos: 0,
             episodes: 0,
             movies: 0,
@@ -104,7 +110,8 @@ impl FolderReport {
 #[derive(Clone)]
 struct PlanFile {
     rel: PathBuf,
-    size: u64,
+    /// `None` 表示扫描时未读取大小。
+    size: Option<u64>,
 }
 
 /// 差异列表的一行：同一季的剧集合并成一行，其它文件逐条显示。
@@ -145,36 +152,58 @@ fn group_plan_files(files: &[PlanFile]) -> Vec<DisplayRow> {
     rows
 }
 
+/// 汇总一组文件的大小；有任意文件未读取大小时返回 `None`。
+fn sum_sizes(files: &[PlanFile]) -> Option<u64> {
+    files
+        .iter()
+        .try_fold(0u64, |total, file| Some(total + file.size?))
+}
+
+/// `（1.2 GiB）` 或空串（未读取大小时不显示）。
+fn size_note(size: Option<u64>) -> String {
+    match size {
+        Some(size) => format!("（{}）", format_bytes(size)),
+        None => String::new(),
+    }
+}
+
+/// `，1.2 GiB` 或空串（大小未知时不显示总量）。
+fn total_note(files: &[PlanFile]) -> String {
+    match sum_sizes(files) {
+        Some(bytes) => format!("，{}", format_bytes(bytes)),
+        None => String::new(),
+    }
+}
+
 /// 渲染差异列表；`-v` 时展开为逐个文件。
 fn render_plan_rows(rows: &[DisplayRow], verbose: bool) -> Vec<String> {
     if verbose {
         return rows
             .iter()
             .flat_map(|row| row.files.iter())
-            .map(|file| format!("{}（{}）", file.rel.display(), format_bytes(file.size)))
+            .map(|file| format!("{}{}", file.rel.display(), size_note(file.size)))
             .collect();
     }
     rows.iter()
         .map(|row| match &row.group {
             Some((series, season)) if row.files.len() > 1 => {
-                let bytes: u64 = row.files.iter().map(|file| file.size).sum();
                 format!(
-                    "{series} S{season:02}（{} 集，{}）",
+                    "{series} S{season:02}（{} 集{}）",
                     row.files.len(),
-                    format_bytes(bytes)
+                    total_note(&row.files)
                 )
             }
             Some((series, season)) => {
                 let file = &row.files[0];
                 let episode = parse_episode(&file.rel).2.unwrap_or(0);
                 format!(
-                    "{series} S{season:02}E{episode:02}（{}）",
-                    format_bytes(file.size)
+                    "{series} S{season:02}E{episode:02}{}",
+                    size_note(file.size)
                 )
             }
             None => {
                 let file = &row.files[0];
-                format!("{}（{}）", file.rel.display(), format_bytes(file.size))
+                format!("{}{}", file.rel.display(), size_note(file.size))
             }
         })
         .collect()
@@ -184,31 +213,68 @@ struct SyncPlan {
     to_copy: Vec<PlanFile>,
     overwrite: Vec<PlanFile>,
     same: usize,
+    /// 仅 `review --full` 全量扫描时可得；定向比对不统计。
     final_only: Vec<PlanFile>,
     skipped: Vec<(PathBuf, String)>,
     copy_bytes: u64,
 }
 
-/// `embydown review`：审查临时文件夹、最终文件夹并给出差异。
-pub fn run(temp: Option<PathBuf>, final_dir: Option<PathBuf>) -> Result<()> {
+impl SyncPlan {
+    fn new() -> Self {
+        Self {
+            to_copy: Vec::new(),
+            overwrite: Vec::new(),
+            same: 0,
+            final_only: Vec::new(),
+            skipped: Vec::new(),
+            copy_bytes: 0,
+        }
+    }
+}
+
+/// `embydown review`：审查临时文件夹，并与最终文件夹对比。
+///
+/// 默认只检查临时文件夹里的文件在最终文件夹中的对应路径，不递归扫描最终文件夹——
+/// 网盘/分享目录上一次 readdir 可能要等很久。`full` 为 true 时才完整扫描。
+pub fn run(temp: Option<PathBuf>, final_dir: Option<PathBuf>, full: bool) -> Result<()> {
     let (temp, final_dir) = resolve_dirs(temp, final_dir)?;
     let temp_report = scan(&temp);
-    let final_report = final_dir.as_deref().map(scan);
 
     print_title("本地审查");
     print_folder(&temp_report, "临时文件夹");
-    match &final_report {
-        Some(report) => print_folder(report, "最终文件夹"),
-        None => {
-            println!("\n[最终文件夹] 未设置（用 --final 指定，或在交互模式「下载设置」中设置）")
-        }
-    }
 
-    if let Some(final_report) = &final_report {
-        let plan = build_plan(&temp_report, final_report, false);
-        println!("\n[临时 → 最终 差异]");
-        print_plan(&plan, true);
-    }
+    let Some(final_dir) = final_dir else {
+        println!("\n[最终文件夹] 未设置（用 --final 指定，或在交互模式「下载设置」中设置）");
+        return Ok(());
+    };
+
+    let plan = if full {
+        // 只读临时文件所在的那几个目录的直属文件，不遍历整棵媒体树。
+        let dirs = parent_scopes(&temp_report);
+        let note = if dirs.is_empty() {
+            "临时文件夹为空，未扫描最终文件夹".to_string()
+        } else {
+            format!(
+                "只扫描临时文件所在的 {} 个目录（不遍历整棵媒体树；只读结构，不比较大小）",
+                dirs.len()
+            )
+        };
+        print_folder_heading(&final_dir, "最终文件夹", Some(&note));
+        let final_report = scan_structure(&final_dir, Some(&dirs));
+        print_folder_body(&final_report);
+        build_plan(&temp_report, &final_report, false)
+    } else {
+        println!("\n[最终文件夹] {}", final_dir.display());
+        if !final_dir.exists() {
+            println!("  不存在");
+        } else {
+            println!("  只检查临时文件夹中的文件是否存在（不扫描整个目录，完整扫描用 review --full）");
+        }
+        build_plan_targeted(&temp_report, &final_dir, false)
+    };
+
+    println!("\n[临时 → 最终 差异]");
+    print_plan(&plan, true);
     Ok(())
 }
 
@@ -228,8 +294,9 @@ pub fn sync(
     ensure_separate(&temp, &final_dir)?;
 
     let temp_report = scan(&temp);
-    let final_report = scan(&final_dir);
-    let plan = build_plan(&temp_report, &final_report, force);
+    // 只 stat 待同步文件在最终文件夹中的对应路径；不递归扫描最终文件夹，
+    // 否则网盘挂载上的无关大目录/分享目录会让同步看起来像卡死。
+    let plan = build_plan_targeted(&temp_report, &final_dir, force);
 
     print_title(if dry_run {
         "同步预览"
@@ -258,15 +325,17 @@ pub fn sync(
         if let Some(bar) = &bar {
             bar.set_message(file.rel.display().to_string());
         }
+        // 临时文件夹是本地目录，扫描时总能拿到大小。
+        let expected_size = file.size.unwrap_or(0);
         match copy_atomic(
             &temp.join(&file.rel),
             &final_dir.join(&file.rel),
-            file.size,
+            expected_size,
             bar.as_ref(),
         ) {
             Ok(()) => {
                 copied += 1;
-                copied_bytes += file.size;
+                copied_bytes += expected_size;
             }
             Err(e) => failures.push((file, e)),
         }
@@ -292,15 +361,16 @@ pub fn sync(
                 if let Some(bar) = &bar {
                     bar.set_message(format!("重试 {}", file.rel.display()));
                 }
+                let expected_size = file.size.unwrap_or(0);
                 match copy_atomic(
                     &temp.join(&file.rel),
                     &final_dir.join(&file.rel),
-                    file.size,
+                    expected_size,
                     bar.as_ref(),
                 ) {
                     Ok(()) => {
                         copied += 1;
-                        copied_bytes += file.size;
+                        copied_bytes += expected_size;
                     }
                     Err(e) => still_failed.push((file, e)),
                 }
@@ -407,7 +477,31 @@ pub(crate) fn ensure_separate(temp: &Path, final_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 临时文件所在的目录（相对路径）；最终端只读这些目录的直属文件。
+fn parent_scopes(temp: &FolderReport) -> BTreeSet<PathBuf> {
+    temp.files
+        .iter()
+        .filter_map(|file| file.rel.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// 扫描文件夹并读取文件大小（用于本地临时文件夹）。
 fn scan(root: &Path) -> FolderReport {
+    scan_with(root, true, None)
+}
+
+/// 只扫描目录结构，不读取文件大小；`dirs` 为 `Some` 时只读这些子目录的直属文件。
+fn scan_structure(root: &Path, dirs: Option<&BTreeSet<PathBuf>>) -> FolderReport {
+    scan_with(root, false, dirs)
+}
+
+fn scan_with(
+    root: &Path,
+    fetch_sizes: bool,
+    dirs: Option<&BTreeSet<PathBuf>>,
+) -> FolderReport {
     if !root.exists() {
         return FolderReport::empty(root, false);
     }
@@ -418,11 +512,36 @@ fn scan(root: &Path) -> FolderReport {
     }
     let mut files = Vec::new();
     let mut scan_errors = Vec::new();
-    walk(root, root, &mut files, 0, &mut scan_errors);
+    match dirs {
+        None => walk(root, root, &mut files, 0, &mut scan_errors, fetch_sizes, true),
+        Some(dirs) => {
+            // 只读临时文件所在目录的直属文件，不递归、不碰其它目录。
+            for dir in dirs {
+                let path = root.join(dir);
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_dir() => {
+                        walk(root, &path, &mut files, 1, &mut scan_errors, fetch_sizes, false);
+                    }
+                    // 目标目录不存在：差异里会显示为待复制。
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => scan_errors.push(format!("无法读取 {}：{e}", path.display())),
+                }
+            }
+        }
+    }
     summarize(root, files, scan_errors)
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors: &mut Vec<String>) {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<FileEntry>,
+    depth: usize,
+    errors: &mut Vec<String>,
+    fetch_sizes: bool,
+    recurse: bool,
+) {
     if depth > MAX_DEPTH {
         errors.push(format!("目录层级过深，已跳过：{}", dir.display()));
         return;
@@ -451,7 +570,9 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors:
             continue;
         }
         if file_type.is_dir() {
-            walk(root, &path, out, depth + 1, errors);
+            if recurse {
+                walk(root, &path, out, depth + 1, errors, fetch_sizes, recurse);
+            }
             continue;
         }
         if !file_type.is_file() {
@@ -460,7 +581,12 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors:
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        // 网盘挂载上逐文件 stat 可能极慢；不需要大小时只按目录项归类。
+        let size = if fetch_sizes {
+            entry.metadata().ok().map(|meta| meta.len())
+        } else {
+            None
+        };
         let (kind, error) = classify_and_check(rel, size);
         let (series, season, episode) = if kind == Kind::Video {
             parse_episode(rel)
@@ -480,7 +606,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, depth: usize, errors:
 }
 
 /// 仅依据目录项判断：文件名决定类型，大小来自目录项，不打开文件。
-fn classify_and_check(rel: &Path, size: u64) -> (Kind, Option<String>) {
+fn classify_and_check(rel: &Path, size: Option<u64>) -> (Kind, Option<String>) {
     let name = rel
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -489,13 +615,13 @@ fn classify_and_check(rel: &Path, size: u64) -> (Kind, Option<String>) {
     if kind == Kind::Incomplete {
         return (kind, None);
     }
-    if size == 0 {
-        return (kind, Some("空文件（0 字节）".into()));
+    match size {
+        Some(0) => (kind, Some("空文件（0 字节）".into())),
+        Some(size) if kind == Kind::Video && size < 1024 => {
+            (kind, Some(format!("文件过小（{}）", format_bytes(size))))
+        }
+        _ => (kind, None),
     }
-    if kind == Kind::Video && size < 1024 {
-        return (kind, Some(format!("文件过小（{}）", format_bytes(size))));
-    }
-    (kind, None)
 }
 
 fn classify(name: &str) -> Kind {
@@ -607,8 +733,10 @@ fn series_from_name(stem: &str) -> Option<String> {
 fn summarize(root: &Path, files: Vec<FileEntry>, scan_errors: Vec<String>) -> FolderReport {
     let mut report = FolderReport::empty(root, true);
     report.scan_errors = scan_errors;
+    report.total_size = files
+        .iter()
+        .try_fold(0u64, |total, file| Some(total + file.size?));
     for file in &files {
-        report.total_size += file.size;
         match file.kind {
             Kind::Video => {
                 report.videos += 1;
@@ -637,7 +765,7 @@ fn summarize(root: &Path, files: Vec<FileEntry>, scan_errors: Vec<String>) -> Fo
                 report.incomplete += 1;
                 // `.part` 与 `.part.json` 属于同一个任务，合并成一条。
                 let target = incomplete_target(&file.rel);
-                let size = report.incomplete_files.entry(target).or_insert(0);
+                let size = report.incomplete_files.entry(target).or_insert(None);
                 *size = (*size).max(file.size);
             }
             Kind::Other => report.other += 1,
@@ -675,7 +803,18 @@ fn print_title(title: &str) {
 }
 
 fn print_folder(report: &FolderReport, label: &str) {
-    println!("\n[{label}] {}", report.root.display());
+    print_folder_heading(&report.root, label, None);
+    print_folder_body(report);
+}
+
+fn print_folder_heading(root: &Path, label: &str, note: Option<&str>) {
+    println!("\n[{label}] {}", root.display());
+    if let Some(note) = note {
+        println!("  {note}");
+    }
+}
+
+fn print_folder_body(report: &FolderReport) {
     if !report.exists {
         println!("  不存在");
         for error in &report.scan_errors {
@@ -683,10 +822,14 @@ fn print_folder(report: &FolderReport, label: &str) {
         }
         return;
     }
+    let size_text = match report.total_size {
+        Some(bytes) => format!("，共 {}", format_bytes(bytes)),
+        None => String::new(),
+    };
     println!(
-        "  文件：{} 个，共 {}（视频 {} · 字幕 {} · 元数据 {} · 图片 {} · 其他 {} · 未完成 {}）",
+        "  文件：{} 个{}（视频 {} · 字幕 {} · 元数据 {} · 图片 {} · 其他 {} · 未完成 {}）",
         report.files.len(),
-        format_bytes(report.total_size),
+        size_text,
         report.videos,
         report.subtitles,
         report.metadata,
@@ -786,7 +929,10 @@ fn print_folder(report: &FolderReport, label: &str) {
         let items: Vec<String> = report
             .incomplete_files
             .iter()
-            .map(|(path, size)| format!("{}（{}）", path.display(), format_bytes(*size)))
+            .map(|(path, size)| match size {
+                Some(bytes) => format!("{}（{}）", path.display(), format_bytes(*bytes)),
+                None => path.display().to_string(),
+            })
             .collect();
         print_items(&items, "- ");
     }
@@ -852,43 +998,36 @@ fn build_plan(temp: &FolderReport, final_report: &FolderReport, force: bool) -> 
         .filter(|file| file.kind != Kind::Incomplete)
         .map(|file| (file.rel.as_path(), file))
         .collect();
-    let mut plan = SyncPlan {
-        to_copy: Vec::new(),
-        overwrite: Vec::new(),
-        same: 0,
-        final_only: Vec::new(),
-        skipped: Vec::new(),
-        copy_bytes: 0,
-    };
+    let mut plan = SyncPlan::new();
 
     for file in &temp.files {
-        if file.kind == Kind::Incomplete {
-            let target = incomplete_target(&file.rel);
-            if !plan.skipped.iter().any(|(path, _)| path == &target) {
-                plan.skipped.push((target, "未完成".into()));
-            }
-            continue;
-        }
-        if let Some(error) = &file.error {
-            plan.skipped.push((file.rel.clone(), error.clone()));
+        if skip_temp_file(file, &mut plan) {
             continue;
         }
         match final_map.get(file.rel.as_path()) {
             None => {
-                plan.copy_bytes += file.size;
+                plan.copy_bytes += file.size.unwrap_or(0);
                 plan.to_copy.push(PlanFile {
                     rel: file.rel.clone(),
                     size: file.size,
                 });
             }
-            Some(existing) if force || existing.size != file.size => {
-                plan.copy_bytes += file.size;
-                plan.overwrite.push(PlanFile {
-                    rel: file.rel.clone(),
-                    size: file.size,
-                });
+            Some(existing) => {
+                // 结构扫描不读取最终文件夹的大小；此时只按“是否存在”判断。
+                let differs = match (file.size, existing.size) {
+                    (Some(temp), Some(final_size)) => temp != final_size,
+                    _ => false,
+                };
+                if force || differs {
+                    plan.copy_bytes += file.size.unwrap_or(0);
+                    plan.overwrite.push(PlanFile {
+                        rel: file.rel.clone(),
+                        size: file.size,
+                    });
+                } else {
+                    plan.same += 1;
+                }
             }
-            Some(_) => plan.same += 1,
         }
     }
 
@@ -907,23 +1046,74 @@ fn build_plan(temp: &FolderReport, final_report: &FolderReport, force: bool) -> 
     plan
 }
 
+/// 定向比对：只检查临时文件夹里的文件在最终文件夹中的对应路径。
+///
+/// 不递归扫描最终文件夹，因此不会碰到与本次同步无关的目录（例如网盘上的
+/// 分享目录）；代价是不再统计「仅最终文件夹有」的文件——同步本来也不会删除它们。
+fn build_plan_targeted(temp: &FolderReport, final_dir: &Path, force: bool) -> SyncPlan {
+    let mut plan = SyncPlan::new();
+    for file in &temp.files {
+        if skip_temp_file(file, &mut plan) {
+            continue;
+        }
+        let existing = fs::symlink_metadata(final_dir.join(&file.rel))
+            .ok()
+            .filter(|meta| meta.file_type().is_file())
+            .map(|meta| meta.len());
+        match existing {
+            None => {
+                plan.copy_bytes += file.size.unwrap_or(0);
+                plan.to_copy.push(PlanFile {
+                    rel: file.rel.clone(),
+                    size: file.size,
+                });
+            }
+            Some(size) if force || file.size.is_none_or(|temp| temp != size) => {
+                plan.copy_bytes += file.size.unwrap_or(0);
+                plan.overwrite.push(PlanFile {
+                    rel: file.rel.clone(),
+                    size: file.size,
+                });
+            }
+            Some(_) => plan.same += 1,
+        }
+    }
+    plan
+}
+
+/// 未完成或异常文件不参与复制；已记录到 `skipped` 时返回 true。
+fn skip_temp_file(file: &FileEntry, plan: &mut SyncPlan) -> bool {
+    if file.kind == Kind::Incomplete {
+        let target = incomplete_target(&file.rel);
+        if !plan.skipped.iter().any(|(path, _)| path == &target) {
+            plan.skipped.push((target, "未完成".into()));
+        }
+        return true;
+    }
+    if let Some(error) = &file.error {
+        plan.skipped.push((file.rel.clone(), error.clone()));
+        return true;
+    }
+    false
+}
+
 fn print_plan(plan: &SyncPlan, preview: bool) {
     if plan.to_copy.is_empty() && plan.overwrite.is_empty() {
         println!("  待复制：0 个");
     } else {
         println!(
-            "  待复制：{} 个，{}",
+            "  待复制：{} 个{}",
             plan.to_copy.len(),
-            format_bytes(plan.to_copy.iter().map(|file| file.size).sum())
+            total_note(&plan.to_copy)
         );
         let items =
             render_plan_rows(&group_plan_files(&plan.to_copy), verbose() >= 1);
         print_items(&items, "- ");
         if !plan.overwrite.is_empty() {
             println!(
-                "  待覆盖：{} 个，{}（最终文件夹里已有但大小不同）",
+                "  待覆盖：{} 个{}（最终文件夹里已有但大小不同）",
                 plan.overwrite.len(),
-                format_bytes(plan.overwrite.iter().map(|file| file.size).sum())
+                total_note(&plan.overwrite)
             );
             let items =
                 render_plan_rows(&group_plan_files(&plan.overwrite), verbose() >= 1);
@@ -933,9 +1123,9 @@ fn print_plan(plan: &SyncPlan, preview: bool) {
     println!("  已一致：{} 个", plan.same);
     if !plan.final_only.is_empty() {
         println!(
-            "  仅最终文件夹有：{} 个，{}（同步不会删除）",
+            "  仅最终文件夹有：{} 个{}（同步不会删除）",
             plan.final_only.len(),
-            format_bytes(plan.final_only.iter().map(|file| file.size).sum())
+            total_note(&plan.final_only)
         );
         let items =
             render_plan_rows(&group_plan_files(&plan.final_only), verbose() >= 1);
@@ -1117,26 +1307,117 @@ mod tests {
 
     #[test]
     fn flags_empty_and_tiny_videos_without_opening_files() {
-        let (kind, error) = classify_and_check(Path::new("movie.mkv"), 0);
+        let (kind, error) = classify_and_check(Path::new("movie.mkv"), Some(0));
         assert_eq!(kind, Kind::Video);
         assert!(error.unwrap().contains("空文件"));
 
-        let (_, error) = classify_and_check(Path::new("movie.mkv"), 512);
+        let (_, error) = classify_and_check(Path::new("movie.mkv"), Some(512));
         assert!(error.unwrap().contains("文件过小"));
 
-        let (_, error) = classify_and_check(Path::new("movie.mkv"), 2048);
+        let (_, error) = classify_and_check(Path::new("movie.mkv"), Some(2048));
         assert!(error.is_none());
 
-        let (kind, error) = classify_and_check(Path::new("movie.mkv.part"), 0);
+        // 只扫描目录结构时没有大小信息，不做大小检查。
+        let (_, error) = classify_and_check(Path::new("movie.mkv"), None);
+        assert!(error.is_none());
+
+        let (kind, error) = classify_and_check(Path::new("movie.mkv.part"), Some(0));
         assert_eq!(kind, Kind::Incomplete);
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn structure_scan_does_not_read_sizes() {
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("电影")).unwrap();
+        fs::write(dir.join("电影/空文件.mkv"), []).unwrap();
+
+        let structure = scan_structure(&dir, None);
+        assert_eq!(structure.files.len(), 1);
+        assert!(structure.files.iter().all(|file| file.size.is_none()));
+        assert!(structure.total_size.is_none());
+        // 没有读取大小，就不做空文件/过小检查。
+        assert!(structure.errors().next().is_none());
+
+        let sized = scan(&dir);
+        assert_eq!(sized.total_size, Some(0));
+        assert!(sized.errors().next().is_some());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parent_scopes_collect_temp_directories() {
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("影视/电影/片名")).unwrap();
+        fs::create_dir_all(dir.join("影视/剧集/某剧/Season 00001")).unwrap();
+        fs::write(dir.join("影视/电影/片名/正片.mkv"), []).unwrap();
+        fs::write(
+            dir.join("影视/剧集/某剧/Season 00001/某剧 - S00001E00001.mkv"),
+            [],
+        )
+        .unwrap();
+
+        let scopes = parent_scopes(&scan(&dir));
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.contains(&PathBuf::from("影视/电影/片名")));
+        assert!(scopes.contains(&PathBuf::from("影视/剧集/某剧/Season 00001")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scoped_scan_only_reads_temp_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("影视/电影/片名/子目录")).unwrap();
+        fs::create_dir_all(dir.join("影视/电影/别的")).unwrap();
+        fs::create_dir_all(dir.join("来自：分享")).unwrap();
+        fs::write(dir.join("影视/电影/片名/正片.mkv"), []).unwrap();
+        fs::write(dir.join("影视/电影/片名/花絮.mkv"), []).unwrap();
+        fs::write(dir.join("影视/电影/片名/子目录/深层.mkv"), []).unwrap();
+        fs::write(dir.join("影视/电影/别的/其它.mkv"), []).unwrap();
+        fs::write(dir.join("来自：分享/别的.mkv"), []).unwrap();
+
+        let dirs: BTreeSet<PathBuf> = [PathBuf::from("影视/电影/片名")].into_iter().collect();
+        let report = scan_structure(&dir, Some(&dirs));
+        let rels: Vec<&Path> = report.files.iter().map(|file| file.rel.as_path()).collect();
+        assert_eq!(rels.len(), 2);
+        assert!(rels.contains(&Path::new("影视/电影/片名/正片.mkv")));
+        assert!(rels.contains(&Path::new("影视/电影/片名/花絮.mkv")));
+        // 只读直属文件，不递归、不碰其它目录。
+        assert!(!rels.contains(&Path::new("影视/电影/片名/子目录/深层.mkv")));
+        assert!(!rels.contains(&Path::new("影视/电影/别的/其它.mkv")));
+        assert!(!rels.contains(&Path::new("来自：分享/别的.mkv")));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn groups_plan_files_by_series_and_season() {
         let file = |rel: &str, size: u64| PlanFile {
             rel: PathBuf::from(rel),
-            size,
+            size: Some(size),
         };
         let files = vec![
             file("影视/剧集/某剧 (2020)/Season 00001/某剧 - S00001E00002.mkv", 100),
@@ -1171,6 +1452,48 @@ mod tests {
         assert!(is_transient_error(&error));
         let error = anyhow::Error::from(std::io::Error::from_raw_os_error(2));
         assert!(!is_transient_error(&error));
+    }
+
+    #[test]
+    fn targeted_plan_checks_only_pending_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let temp = dir.join("downloads");
+        let final_dir = dir.join("library");
+        fs::create_dir_all(temp.join("影视/电影")).unwrap();
+        fs::create_dir_all(final_dir.join("影视/电影")).unwrap();
+        // 最终文件夹里与本次同步无关的内容，不应被扫描进计划。
+        fs::create_dir_all(final_dir.join("来自：分享")).unwrap();
+        fs::write(final_dir.join("来自：分享/别的电影.mkv"), [9u8; 64]).unwrap();
+
+        fs::write(temp.join("影视/电影/一致.mkv"), [1u8; 2048]).unwrap();
+        fs::write(final_dir.join("影视/电影/一致.mkv"), [2u8; 2048]).unwrap();
+        fs::write(temp.join("影视/电影/覆盖.mkv"), [3u8; 2048]).unwrap();
+        fs::write(final_dir.join("影视/电影/覆盖.mkv"), [4u8; 1024]).unwrap();
+        fs::write(temp.join("影视/电影/新增.mkv"), [5u8; 2048]).unwrap();
+        fs::write(temp.join("影视/电影/未完成.mkv.part"), [6u8; 2048]).unwrap();
+
+        let temp_report = scan(&temp);
+        let plan = build_plan_targeted(&temp_report, &final_dir, false);
+        assert_eq!(plan.same, 1);
+        assert_eq!(plan.overwrite.len(), 1);
+        assert_eq!(plan.overwrite[0].rel, PathBuf::from("影视/电影/覆盖.mkv"));
+        assert_eq!(plan.to_copy.len(), 1);
+        assert_eq!(plan.to_copy[0].rel, PathBuf::from("影视/电影/新增.mkv"));
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.final_only.is_empty());
+
+        let forced = build_plan_targeted(&temp_report, &final_dir, true);
+        assert_eq!(forced.same, 0);
+        assert_eq!(forced.overwrite.len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

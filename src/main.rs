@@ -73,7 +73,11 @@ async fn run(cli: Cli) -> Result<()> {
             version,
             force,
         } => update::run(check, version, force).await,
-        Cmd::Review { temp, final_dir } => review::run(temp, final_dir),
+        Cmd::Review {
+            temp,
+            final_dir,
+            full,
+        } => review::run(temp, final_dir, full),
         Cmd::Sync {
             dry_run,
             force,
