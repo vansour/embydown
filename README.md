@@ -34,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/vansour/embydown/main/install.sh | 
 ```bash
 embydown update                 # 更新到最新正式版
 embydown update --check         # 只检查版本，不下载
-embydown update --version v0.0.8
+embydown update --version v0.0.9
 embydown update --force         # 已是最新版本也重新安装
 ```
 
@@ -97,7 +97,7 @@ embydown ui           # 等价写法（也可以写 embydown interactive）
 | 5 下载设置 | 临时文件夹、最终文件夹、连接数、每服务器并发、限速、字幕、覆盖、续传、命名模板（修改后立即保存） |
 | 6 未完成任务找回 | 递归扫描 `.part` / `.part.json`，搜索来源并写回原路径续传 |
 | 7 下载记录 | 查看历史记录（最新在前） |
-| 8 本地审查 | 检查临时/最终文件夹的内容、缺集、异常文件与同步差异（只读目录项，不打开文件） |
+| 8 本地审查 | 检查临时文件夹、缺集、异常文件与同步差异；默认不递归扫描最终目录 |
 | 9 同步到最终文件夹 | 把临时文件夹复制到最终文件夹（会先预览） |
 
 菜单里直接回车会取消当前操作或返回上一级，`0` 返回上一级 / 退出，`Ctrl+C` 随时退出。
@@ -191,10 +191,15 @@ embydown sync --force          # 大小相同的文件也重新复制
 审查完全在本地完成，不访问服务器，也**不会打开文件读取内容**；
 只依据目录项（文件名/路径与大小）判断：
 
-- 统计视频 / 字幕 / 元数据 / 图片数量与总大小，列出剧集（含季数）和影片
+- 临时文件夹：统计视频 / 字幕 / 元数据 / 图片数量与总大小，列出剧集（含季数）和影片
+- 最终文件夹：默认只检查临时文件夹里的文件在目标端是否存在、大小是否一致，
+  **不递归扫描最终目录**（网盘/分享目录的 readdir 可能非常慢）；
+  `review --full` 也只读取临时文件所在目录的直属文件（例如这次同步的 13 个影片目录），
+  不遍历整棵媒体树，只读目录结构、不读文件大小。耗时只跟临时文件夹有关，
+  最终库多大都不影响
 - 按 `SxxExx` 检查集号连续性，报告缺集（如缺少 E03）与重复集（可能是多版本）
-- 检查空文件、过小视频，以及 `.part` / `.part.json` 等未完成文件
-- 对比临时 / 最终文件夹，列出待复制、待覆盖、已一致、仅最终有；
+- 检查临时文件夹里的空文件、过小视频，以及 `.part` / `.part.json` 等未完成文件
+- 对比临时 / 最终文件夹，列出待复制、待覆盖、已一致；`--full` 时还列出仅最终有；
   剧集按「剧名 + 季」聚合（如 `S01（24 集，25.5 GiB）`），加 `-v` 展开为逐个文件
 
 同步规则：
@@ -294,6 +299,7 @@ embydown pause --server media.micu.hk
 # 本地审查临时/最终文件夹（缺集、重复集、未完成/异常文件、同步差异）
 embydown review
 embydown review --temp ./downloads --final ./library
+embydown review --full         # 额外读取临时文件所在目录的直属文件（只读结构）
 
 # 同步临时文件夹到最终文件夹（--dry-run 只预览）
 embydown sync --dry-run
@@ -303,7 +309,7 @@ embydown sync --force
 # 自更新（首次安装后不再需要 curl；下载并校验 SHA-256 后替换当前二进制）
 embydown update
 embydown update --check             # 只检查版本
-embydown update --version v0.0.8    # 安装指定版本
+embydown update --version v0.0.9    # 安装指定版本
 embydown update --force             # 已是最新也重新安装
 ```
 
@@ -382,14 +388,14 @@ embydown dl <ID> --pattern '影视/剧集/{series} ({seriesyear})/Season {season
 
 版本号在 `Cargo.toml`，变更记录见 [CHANGELOG.md](CHANGELOG.md)；推送 `v*` 标签会触发 `.github/workflows/release.yml`：
 
-- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.8` 对应版本 `0.0.8`）
+- 校验标签与 `Cargo.toml` 版本一致（例如标签 `v0.0.9` 对应版本 `0.0.9`）
 - 构建 x86_64 release，打包二进制、README、CHANGELOG 和 install.sh，生成 SHA-256
 - 同时上传裸二进制（`embydown-vX.Y.Z-x86_64-unknown-linux-gnu.bin` 与稳定别名）供 `embydown update` 使用
 - 创建 GitHub Release 并上传产物
 
 ```bash
-git tag v0.0.8
-git push origin v0.0.8
+git tag v0.0.9
+git push origin v0.0.9
 ```
 
 `main` 分支的 push / PR 会运行 `.github/workflows/ci.yml`（clippy、测试、release 构建）。

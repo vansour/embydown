@@ -1,7 +1,25 @@
 # 变更记录
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
-发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.8` ↔ `0.0.8`）。
+发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.9` ↔ `0.0.9`）。
+
+## [0.0.9] - 2026-11-01
+
+### 变更
+
+- 同步（`embydown sync` / 主菜单 9）不再递归扫描整个最终文件夹，只对临时文件夹里的
+  每个文件检查对应的最终路径（缺失 / 大小不同 / 一致）。最终文件夹是 CloudDrive2
+  等网盘挂载时，不再因为无关的分享目录而长时间卡住。
+- 本地审查（`embydown review` / 主菜单 8）默认只检查临时文件在最终端是否存在、
+  大小是否一致；新增 `review --full`，只额外读取临时文件所在目录的直属文件，
+  不遍历整棵媒体树。
+- `review --full` 只读取目录结构、不逐文件读取大小；审查与同步的耗时只跟临时
+  文件夹有关，最终库再大也不受影响。
+
+### 修复
+
+- 修复在网盘挂载（CloudFS/FUSE）上同步或审查时进程卡在 `readdir`、Ctrl+C
+  无响应的问题。
 
 ## [0.0.8] - 2026-10-31
 
@@ -165,6 +183,7 @@
 - 一键安装脚本 `install.sh`。
 - GitHub Actions：CI 与 tag 发布 Release。
 
+[0.0.9]: https://github.com/vansour/embydown/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/vansour/embydown/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/vansour/embydown/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/vansour/embydown/compare/v0.0.5...v0.0.6
