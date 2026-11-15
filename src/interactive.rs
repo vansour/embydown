@@ -394,7 +394,7 @@ impl App {
             let term = term.to_string();
             async move {
                 let result =
-                    tokio::time::timeout(SEARCH_TIMEOUT, client.search(&term, SEARCH_LIMIT))
+                    tokio::time::timeout(SEARCH_TIMEOUT, client.search_titles(&term, SEARCH_LIMIT))
                         .await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("搜索超时")));
                 (name, result)
@@ -451,10 +451,7 @@ impl App {
                 .await
                 .with_context(|| format!("解析 {} 失败", root.title()))?
         } else {
-            let mut files = vec![root.clone()];
-            // 单集直接下载时补上所属剧集的 TMDB ID，供默认命名使用。
-            crate::enrich_series_tmdb(&client, &mut files).await;
-            files
+            vec![root.clone()]
         };
         if files.is_empty() {
             println!("{} 没有可下载的条目", yellow("!"));
@@ -1708,6 +1705,32 @@ struct SourceOption {
     name: String,
 }
 
+impl SourceOption {
+    fn new(
+        hit: &Hit,
+        item: Item,
+        version: String,
+        info: (Option<u64>, String, String, String, String),
+    ) -> Self {
+        let (size, res, video, audio, container) = info;
+        Self {
+            server: hit.server.clone(),
+            item,
+            kind: hit.item.display_type().to_string(),
+            year: hit
+                .item
+                .production_year
+                .filter(|y| *y >= 1800)
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "-".into()),
+            version,
+            size,
+            spec: spec_label(&res, &video, &audio, &container),
+            name: hit.item.title(),
+        }
+    }
+}
+
 fn group_hits(hits: Vec<Hit>, term: &str) -> Vec<TitleGroup> {
     let mut groups: Vec<TitleGroup> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -1764,42 +1787,32 @@ fn source_options(group: &TitleGroup) -> Vec<SourceOption> {
     let mut out = Vec::new();
     for hit in &group.hits {
         let sources = hit.item.media_sources.as_deref().unwrap_or_default();
-        let (size, res, video, audio, container) = if let Some(src) = sources.first() {
-            crate::file_info_source(&hit.item, Some(src))
-        } else {
-            crate::file_info(&hit.item)
-        };
-        let version = match sources.len() {
-            0 => hit.item.version.clone().unwrap_or_default(),
-            1 => crate::source_version_label(&hit.item, &sources[0], 0),
-            n => {
-                let labels: Vec<String> = sources
-                    .iter()
-                    .enumerate()
-                    .map(|(i, src)| crate::source_version_label(&hit.item, src, i))
-                    .filter(|label| !label.is_empty())
-                    .collect();
-                match labels.first() {
-                    Some(first) => format!("{first} 等 {n} 个版本"),
-                    None => format!("{n} 个版本"),
-                }
-            }
-        };
-        out.push(SourceOption {
-            server: hit.server.clone(),
-            item: hit.item.clone(),
-            kind: hit.item.display_type().to_string(),
-            year: hit
-                .item
-                .production_year
-                .filter(|y| *y >= 1800)
-                .map(|y| y.to_string())
-                .unwrap_or_else(|| "-".into()),
-            version,
-            size,
-            spec: spec_label(&res, &video, &audio, &container),
-            name: hit.item.title(),
-        });
+        if sources.len() <= 1 {
+            let source = sources.first();
+            let version = match source {
+                Some(src) => crate::source_version_label(&hit.item, src, 0),
+                None => hit.item.version.clone().unwrap_or_default(),
+            };
+            out.push(SourceOption::new(
+                hit,
+                hit.item.clone(),
+                version,
+                crate::file_info_source(&hit.item, source),
+            ));
+            continue;
+        }
+        // 多个版本时每个版本占一行，选中后直接锁定该媒体源，不再二次询问。
+        for (i, src) in sources.iter().enumerate() {
+            let mut item = hit.item.clone();
+            crate::apply_source(&mut item, sources, i);
+            let version = item.version.clone().unwrap_or_default();
+            out.push(SourceOption::new(
+                hit,
+                item,
+                version,
+                crate::file_info_source(&hit.item, Some(src)),
+            ));
+        }
     }
     out
 }
@@ -2504,6 +2517,56 @@ mod tests {
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].server, "media");
         assert_eq!(options[0].version, "1080p");
+    }
+
+    #[test]
+    fn source_list_expands_multiple_versions() {
+        let group = TitleGroup {
+            title: "阿凡达".into(),
+            kind: "Movie".into(),
+            year: Some(2009),
+            season: None,
+            episode: None,
+            score: 5000,
+            hits: vec![Hit {
+                server: "media".into(),
+                item: Item {
+                    name: Some("阿凡达".into()),
+                    item_type: Some("Movie".into()),
+                    production_year: Some(2009),
+                    media_sources: Some(vec![
+                        crate::model::MediaSource {
+                            name: Some("阿凡达 (2009) 1080p.mkv".into()),
+                            size: Some(1024),
+                            ..Default::default()
+                        },
+                        crate::model::MediaSource {
+                            name: Some("阿凡达 (2009) 2160p.mkv".into()),
+                            size: Some(4096),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+            }],
+        };
+        let options = source_options(&group);
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].version, "1080p");
+        assert_eq!(options[1].version, "2160p");
+        assert_eq!(options[0].size, Some(1024));
+        assert_eq!(options[1].size, Some(4096));
+        // 选中某一行后已锁定对应媒体源，不再弹出版本选择。
+        for option in &options {
+            assert_eq!(option.item.media_sources.as_ref().unwrap().len(), 1);
+            assert!(option.item.source_locked);
+        }
+        assert_eq!(
+            options[0].item.media_sources.as_ref().unwrap()[0]
+                .name
+                .as_deref(),
+            Some("阿凡达 (2009) 1080p.mkv")
+        );
     }
 
     #[test]

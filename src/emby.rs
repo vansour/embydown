@@ -376,13 +376,32 @@ impl Client {
     }
 
     pub async fn search(&self, term: &str, limit: u32) -> Result<Vec<Item>> {
+        self.search_items(term, limit, true).await
+    }
+
+    /// 只按影片/剧集名称搜索，不返回单集结果。
+    ///
+    /// 交互模式「先选影片、再选来源」只关心影片本身；单集名称命中会把
+    /// 同一部剧拆成大量结果，也会让集名左右搜索排序。
+    pub async fn search_titles(&self, term: &str, limit: u32) -> Result<Vec<Item>> {
+        self.search_items(term, limit, false).await
+    }
+
+    async fn search_items(
+        &self,
+        term: &str,
+        limit: u32,
+        include_episodes: bool,
+    ) -> Result<Vec<Item>> {
+        let types = if include_episodes {
+            "Movie,Series,Episode,Video,Audio,MusicVideo"
+        } else {
+            "Movie,Series,Video,Audio,MusicVideo"
+        };
         let q: Vec<(&str, String)> = vec![
             ("SearchTerm", term.to_string()),
             ("Recursive", "true".to_string()),
-            (
-                "IncludeItemTypes",
-                "Movie,Series,Episode,Video,Audio,MusicVideo".to_string(),
-            ),
+            ("IncludeItemTypes", types.to_string()),
             ("Fields", FIELDS.to_string()),
         ];
         // 服务器返回顺序可能是按名称而不是相关度，直接截断会把真正相关的条目挤掉。
@@ -392,6 +411,10 @@ impl Client {
             .query_items(&format!("/Users/{}/Items", self.user_id), &q, Some(fetch))
             .await
             .context("搜索失败")?;
+        // 个别服务器会忽略 IncludeItemTypes，这里兜底剔除单集结果。
+        if !include_episodes {
+            items.retain(|item| item.item_type.as_deref() != Some("Episode"));
+        }
         items.sort_by_cached_key(|item| {
             (
                 std::cmp::Reverse(item.search_score(term)),
@@ -479,7 +502,7 @@ impl Client {
     }
 }
 
-const FIELDS: &str = "MediaSources,MediaStreams,Path,Overview,ProductionYear,ParentId,SeriesId,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,RunTimeTicks,DateCreated,BasicSyncInfo,ProviderIds";
+const FIELDS: &str = "MediaSources,MediaStreams,Path,Overview,ProductionYear,ParentId,SeriesId,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,RunTimeTicks,DateCreated,BasicSyncInfo";
 
 /// 规范化服务器地址：补 scheme、去尾斜杠、去多余空白。
 pub fn normalize_server(input: &str) -> Result<String> {

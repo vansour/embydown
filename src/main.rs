@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 
 use crate::cli::{Cli, Cmd, LoginArgs};
@@ -1660,16 +1660,6 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
                 } else {
                     node.series_name.clone()
                 };
-                let inherited_series_id = match node.item_type.as_deref() {
-                    Some("Series") => Some(node.id.clone()),
-                    Some("Season") => node.series_id.clone().or_else(|| node.parent_id.clone()),
-                    _ => node.series_id.clone(),
-                };
-                // 单集自身的 ProviderIds.Tmdb 是单集 ID；目录命名需要剧集 ID。
-                let inherited_series_tmdb = match node.item_type.as_deref() {
-                    Some("Series") => node.tmdb_id().map(str::to_string),
-                    _ => node.series_tmdb_id.clone(),
-                };
                 let inherited_season = if node.item_type.as_deref() == Some("Season") {
                     node.index_number
                 } else {
@@ -1691,12 +1681,6 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
                         .unwrap_or(false);
                     if !has_series {
                         c.series_name = inherited_series.clone();
-                    }
-                    if c.series_id.is_none() {
-                        c.series_id = inherited_series_id.clone();
-                    }
-                    if c.series_tmdb_id.is_none() {
-                        c.series_tmdb_id = inherited_series_tmdb.clone();
                     }
                     if c.parent_index_number.is_none() {
                         c.parent_index_number = inherited_season;
@@ -1740,41 +1724,7 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
         }
         is_playable(c)
     });
-    // 直接下载单集/单季时，列表接口不会沿 Series 继承 ProviderIds；
-    // 补一次剧集详情查询，供默认命名写入 `[tmdbid-…]`。
-    enrich_series_tmdb(client, &mut out).await;
     Ok(out)
-}
-
-/// 给剧集条目补上所属剧集的 TMDB ID。
-///
-/// 单集自身的 `ProviderIds.Tmdb` 是单集 ID，不能用于剧集目录命名。
-/// 从 Series 展开时通常已在 [`resolve_item`] 中继承；这里兜底处理直接
-/// 下载单集/单季、或服务器列表接口不返回 Series ProviderIds 的情况。
-/// 查询失败时静默跳过，不影响下载。
-pub(crate) async fn enrich_series_tmdb(client: &Client, items: &mut [Item]) {
-    let missing: BTreeSet<String> = items
-        .iter()
-        .filter(|item| item.item_type.as_deref() == Some("Episode"))
-        .filter(|item| item.series_tmdb_id.is_none())
-        .filter_map(|item| item.series_id.clone())
-        .collect();
-    for series_id in missing {
-        let Ok(series) = client.item(&series_id).await else {
-            continue;
-        };
-        let Some(tmdb) = series.provider_id("Tmdb") else {
-            continue;
-        };
-        for item in items.iter_mut() {
-            if item.item_type.as_deref() == Some("Episode")
-                && item.series_tmdb_id.is_none()
-                && item.series_id.as_deref() == Some(series_id.as_str())
-            {
-                item.series_tmdb_id = Some(tmdb.to_string());
-            }
-        }
-    }
 }
 
 /// 是否有可下载的媒体源。

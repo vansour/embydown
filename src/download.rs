@@ -1418,7 +1418,7 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
             let _permit = permit;
             let default_pattern = naming::default_pattern(&item);
             let rel = naming::render(
-                opts.pattern.as_deref().unwrap_or(&default_pattern),
+                opts.pattern.as_deref().unwrap_or(default_pattern),
                 &item,
                 &item.ext(),
             );
@@ -1600,7 +1600,7 @@ pub async fn download_one(
 ) -> Result<OneResult> {
     let default_pattern = naming::default_pattern(item);
     let rel = naming::render(
-        opts.pattern.as_deref().unwrap_or(&default_pattern),
+        opts.pattern.as_deref().unwrap_or(default_pattern),
         item,
         &item.ext(),
     );

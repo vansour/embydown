@@ -181,8 +181,7 @@ pub enum Cmd {
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
 
-        /// 命名模板，如 "{series} ({seriesyear}){tmdbidtag}/Season {season00}/{series} - S{season00}E{episode00}.{ext}"；
-        /// {tmdbid} 为原始 TMDB ID，{tmdbidtag} 为可选的 " [tmdbid-123]"（取不到时为空）
+        /// 命名模板，如 "{series} ({seriesyear})/Season {season00}/{series} - S{season00}E{episode00}.{ext}"
         #[arg(long)]
         pattern: Option<String>,
 

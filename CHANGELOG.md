@@ -1,7 +1,18 @@
 # 变更记录
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
-发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.10` ↔ `0.0.10`）。
+发布时 tag 需与 `Cargo.toml` 中的版本一致（如 `v0.0.11` ↔ `0.0.11`）。
+
+## [0.0.11] - 2026-11-15
+
+### 变更
+
+- 移除 TMDB 命名标识：默认命名不再在年份后追加 `[tmdbid-…]`，
+  同时移除 `{tmdbid}` / `{tmdbidtag}` 占位符。
+- 交互搜索的「来源」列表在多版本时按版本逐行显示各自的大小与规格；
+  选中某一行即直接下载该版本，不再二次选择版本。
+- 交互搜索只按影片/剧集名称匹配，不再把单集名称作为搜索条件或返回单集结果，
+  避免同一部剧被拆成大量条目。
 
 ## [0.0.10] - 2026-11-15
 
@@ -222,6 +233,7 @@
 - 一键安装脚本 `install.sh`。
 - GitHub Actions：CI 与 tag 发布 Release。
 
+[0.0.11]: https://github.com/vansour/embydown/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/vansour/embydown/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/vansour/embydown/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/vansour/embydown/compare/v0.0.7...v0.0.8

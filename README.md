@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/vansour/embydown/main/install.sh | 
 ```bash
 embydown update                 # 最新正式版
 embydown update --check         # 只检查版本
-embydown update --version v0.0.10
+embydown update --version v0.0.11
 embydown update --force         # 已是最新也重新安装
 ```
 
@@ -119,23 +119,18 @@ embydown update
 
 下载直接保存到**下载文件夹**，默认结构：
 
-- 电影：`影视/电影/{title} ({year}) [tmdbid-…]/{title} ({year}) [tmdbid-…].{ext}`
-- 剧集：`影视/剧集/{series} ({seriesyear}) [tmdbid-…]/Season {season00}/{series} - S{season00}E{episode00}.{ext}`
+- 电影：`影视/电影/{title} ({year})/{title} ({year}).{ext}`
+- 剧集：`影视/剧集/{series} ({seriesyear})/Season {season00}/{series} - S{season00}E{episode00}.{ext}`
 - 音乐 / 其他：`影视/音乐/{title}.{ext}`、`影视/其他/{title}.{ext}`
-
-`[tmdbid-…]` 是 Emby/Jellyfin 支持的元数据 ID 标记，服务器返回 TMDB ID 时自动追加，
-取不到时整段省略。剧集使用**所属剧集**的 TMDB ID（单集自身的 TMDB ID 不用于目录命名），
-直接下载单集/单季时会自动查询一次剧集详情。
 
 `--pattern` 占位符：
 
 ```
-{title} {series} {season} {season00} {season5} {episode} {episode00} {episode5} {year} {seriesyear} {tmdbid} {tmdbidtag} {version} {ext} {type} {id} {container}
+{title} {series} {season} {season00} {season5} {episode} {episode00} {episode5} {year} {seriesyear} {version} {ext} {type} {id} {container}
 ```
 
 `{season00}` / `{episode00}` 至少两位补零（`01`、`99`），季/集超过 99 时自动使用三位（`100`）；
-`{season5}` / `{episode5}` 固定五位。`{tmdbid}` 输出原始 ID；`{tmdbidtag}` 输出
-` [tmdbid-123]`（含前导空格，缺失时为空），可写成 `{title} ({year}){tmdbidtag}`。
+`{season5}` / `{episode5}` 固定五位。
 
 `--version all` 下载多个版本时，版本名会加入上一级目录避免覆盖；路径中的非法字符替换为 `_`。
 
