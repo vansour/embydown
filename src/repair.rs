@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn episode_keyword_uses_series_name() {
-        let dest = Path::new("/x/庆余年 (2019)/Season 00001/庆余年 - S00001E00001.mkv");
+        let dest = Path::new("/x/庆余年 (2019)/Season 01/庆余年 - S01E01.mkv");
         let (keyword, se) = derive_keyword(dest);
         assert_eq!(keyword, "庆余年");
         assert_eq!(se, Some((1, 1)));

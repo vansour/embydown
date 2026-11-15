@@ -7,7 +7,7 @@
 //!    不支持就退化成单连接流式下载。
 //! 3. 每个块写完即记入 `<file>.part.json`，中断后重跑同一条命令可续传。
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER};
@@ -41,7 +41,9 @@ const DEFAULT_TARGET_CHUNKS: u64 = 8;
 
 /// 默认块大小：只由文件大小决定，与 `-c` 无关。
 fn default_chunk_size(total: u64) -> u64 {
-    total.div_ceil(DEFAULT_TARGET_CHUNKS).clamp(MIN_CHUNK, MAX_CHUNK)
+    total
+        .div_ceil(DEFAULT_TARGET_CHUNKS)
+        .clamp(MIN_CHUNK, MAX_CHUNK)
 }
 
 /// 429 自动等待上限。超过这个时长就中止本次任务，避免进程挂起一小时。
@@ -261,10 +263,7 @@ async fn lock_dest(path: &Path) -> OwnedMutexGuard<()> {
 }
 
 /// 等待目标锁期间也响应取消，避免一个卡住的任务把同路径的后续任务也拖死。
-async fn lock_dest_cancellable(
-    path: &Path,
-    cancel: &AtomicBool,
-) -> Option<OwnedMutexGuard<()>> {
+async fn lock_dest_cancellable(path: &Path, cancel: &AtomicBool) -> Option<OwnedMutexGuard<()>> {
     tokio::select! {
         biased;
         _ = wait_cancelled(cancel) => None,
@@ -549,6 +548,15 @@ async fn download_file(
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
     }
 
+    // 未启用覆盖时绝不覆盖已存在的目标文件。调用方通常已经提前判断并
+    // 跳过/报错，这里兜底处理并发创建或其它直接调用路径。
+    if dest.exists() && !opts.overwrite {
+        bail!(
+            "目标文件已存在：{}（未启用覆盖；加 --overwrite 覆盖）",
+            dest.display()
+        );
+    }
+
     // 依次探测候选直链，第一个能用的就开工
     let mut probe_result: Option<Probe> = None;
     let mut used_url = String::new();
@@ -578,9 +586,8 @@ async fn download_file(
             }
         }
     }
-    let probe = probe_result.ok_or_else(|| {
-        last_err.unwrap_or_else(|| anyhow!("没有任何可用的直链"))
-    })?;
+    let probe =
+        probe_result.ok_or_else(|| last_err.unwrap_or_else(|| anyhow!("没有任何可用的直链")))?;
 
     let total = probe.total;
     pb.set_length(total.unwrap_or(0));
@@ -639,7 +646,9 @@ async fn download_file(
                 written
             );
         }
-        let meta = tokio::fs::metadata(&part).await.context("读取临时文件失败")?;
+        let meta = tokio::fs::metadata(&part)
+            .await
+            .context("读取临时文件失败")?;
         if meta.len() != t {
             bail!(
                 "临时文件大小不符：期望 {} 字节，实际 {} 字节（保留 .part 便于续传）",
@@ -929,13 +938,7 @@ async fn fetch_chunk(
                 }
                 vlog(
                     1,
-                    format!(
-                        "  ↳ 块 {}-{} 第 {} 次失败: {}",
-                        start,
-                        end,
-                        attempt + 1,
-                        e
-                    ),
+                    format!("  ↳ 块 {}-{} 第 {} 次失败: {}", start, end, attempt + 1, e),
                 );
                 last = Some(e);
                 tokio::time::sleep(Duration::from_millis(400u64 << attempt)).await;
@@ -956,9 +959,7 @@ async fn fetch_chunk_once(
     limiter: &Limiter,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let req = http
-        .get(url)
-        .header(RANGE, format!("bytes={start}-{end}"));
+    let req = http.get(url).header(RANGE, format!("bytes={start}-{end}"));
     let resp = tokio::select! {
         biased;
         _ = wait_cancelled(cancel) => return Err(anyhow::Error::new(Cancelled)),
@@ -1013,7 +1014,9 @@ async fn fetch_chunk_once(
         let Some(chunk) = next else { break };
         match chunk {
             Ok(bytes) => {
-                file.write_all(&bytes).await.context("写盘失败（磁盘满？）")?;
+                file.write_all(&bytes)
+                    .await
+                    .context("写盘失败（磁盘满？）")?;
                 written += bytes.len() as u64;
                 pb.inc(bytes.len() as u64);
                 if !limiter
@@ -1057,13 +1060,14 @@ async fn download_single(
     range_ok: bool,
 ) -> Result<u64> {
     let existing = if resume {
-        tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0)
+        tokio::fs::metadata(part)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
     } else {
         0
     };
-    let can_resume = existing > 0
-        && range_ok
-        && total.map(|t| existing < t).unwrap_or(false);
+    let can_resume = existing > 0 && range_ok && total.map(|t| existing < t).unwrap_or(false);
     let start = if can_resume { existing } else { 0 };
 
     let gate = rate_limit_for(url);
@@ -1107,7 +1111,10 @@ async fn download_single(
     let code = resp.status().as_u16();
     if start > 0 && code != 206 {
         // 服务器没按 Range 回包，只能重头来
-        vlog(1, format!("  ↳ 服务器未按 Range 响应（HTTP {code}），从头下载"));
+        vlog(
+            1,
+            format!("  ↳ 服务器未按 Range 响应（HTTP {code}），从头下载"),
+        );
         return Box::pin(download_single(
             http, url, part, state_file, total, pb, limiter, cancel, false, false,
         ))
@@ -1120,7 +1127,13 @@ async fn download_single(
         bail!("服务器返回的是网页/错误页（Content-Type: {ct}），不是媒体文件");
     }
     if start > 0 {
-        vlog(1, format!("  ↳ 单连接续传：从 {} 继续", crate::util::format_bytes(start)));
+        vlog(
+            1,
+            format!(
+                "  ↳ 单连接续传：从 {} 继续",
+                crate::util::format_bytes(start)
+            ),
+        );
         pb.set_position(start);
     }
 
@@ -1155,7 +1168,9 @@ async fn download_single(
         };
         let Some(chunk) = next else { break };
         let bytes = chunk.map_err(|e| net_error("传输中断", e))?;
-        file.write_all(&bytes).await.context("写盘失败（磁盘满？）")?;
+        file.write_all(&bytes)
+            .await
+            .context("写盘失败（磁盘满？）")?;
         written += bytes.len() as u64;
         pb.inc(bytes.len() as u64);
         if !limiter
@@ -1250,15 +1265,9 @@ async fn download_subs(
             *n += 1;
             *n
         };
-        let disambiguator = (group_counts.get(&key).copied().unwrap_or(0) > 1)
-            .then(|| nth.to_string());
-        let rel = naming::subtitle_path(
-            video_rel,
-            &lang,
-            &ext,
-            forced,
-            disambiguator.as_deref(),
-        );
+        let disambiguator =
+            (group_counts.get(&key).copied().unwrap_or(0) > 1).then(|| nth.to_string());
+        let rel = naming::subtitle_path(video_rel, &lang, &ext, forced, disambiguator.as_deref());
         let file_name = Path::new(&rel)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -1281,16 +1290,16 @@ async fn download_subs(
                 Ok(false) => continue,
                 Err(e) => vlog(
                     2,
-                    format!(
-                        "  ↳ 字幕下载失败: {}",
-                        emby::redact_text(&format!("{e}"))
-                    ),
+                    format!("  ↳ 字幕下载失败: {}", emby::redact_text(&format!("{e}"))),
                 ),
             }
             limiter.acquire(1024).await;
         }
         if !saved {
-            vlog(2, format!("  ↳ 跳过字幕 {lang}（服务器未提供可下载的外挂字幕）"));
+            vlog(
+                2,
+                format!("  ↳ 跳过字幕 {lang}（服务器未提供可下载的外挂字幕）"),
+            );
         }
         if cancel.load(Ordering::SeqCst) {
             break;
@@ -1407,10 +1416,9 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
 
         set.spawn(async move {
             let _permit = permit;
+            let default_pattern = naming::default_pattern(&item);
             let rel = naming::render(
-                opts.pattern
-                    .as_deref()
-                    .unwrap_or_else(|| naming::default_pattern(&item)),
+                opts.pattern.as_deref().unwrap_or(&default_pattern),
                 &item,
                 &item.ext(),
             );
@@ -1441,17 +1449,30 @@ pub async fn execute(client: &Client, items: Vec<Item>, opts: DownloadOpts) -> R
                 return TaskResult::Cancelled;
             };
 
-            // 已完整存在则跳过
+            // 已存在则不覆盖：大小一致视为完成；大小不一致说明现有文件
+            // 可能损坏或来自其它版本，必须显式 --overwrite 才重新下载。
             if dest.exists() && !opts.overwrite {
                 let existing = tokio::fs::metadata(&dest).await.map(|m| m.len()).ok();
-                if let Some(size) = item.size() {
-                    if existing == Some(size) {
+                match item.size() {
+                    Some(expected) if existing == Some(expected) => {
                         println!("⏭  已存在，跳过: {rel}");
                         return TaskResult::Skipped;
                     }
-                } else {
-                    println!("⏭  已存在，跳过: {rel}（加 --overwrite 覆盖）");
-                    return TaskResult::Skipped;
+                    Some(expected) => {
+                        eprintln!(
+                            "✗ 目标文件已存在但大小不一致（现有 {}，预期 {}），未覆盖: {rel}\n   加 --overwrite 可重新下载",
+                            existing
+                                .map(format_bytes)
+                                .unwrap_or_else(|| "未知".to_string()),
+                            format_bytes(expected)
+                        );
+                        fail_streak.fetch_add(1, Ordering::SeqCst);
+                        return TaskResult::Failed;
+                    }
+                    None => {
+                        println!("⏭  已存在，跳过: {rel}（加 --overwrite 覆盖）");
+                        return TaskResult::Skipped;
+                    }
                 }
             }
 
@@ -1577,10 +1598,9 @@ pub async fn download_one(
     cancel: &Arc<AtomicBool>,
     pb: &ProgressBar,
 ) -> Result<OneResult> {
+    let default_pattern = naming::default_pattern(item);
     let rel = naming::render(
-        opts.pattern
-            .as_deref()
-            .unwrap_or_else(|| naming::default_pattern(item)),
+        opts.pattern.as_deref().unwrap_or(&default_pattern),
         item,
         &item.ext(),
     );
@@ -1602,21 +1622,30 @@ pub async fn download_one(
         return Err(anyhow::Error::new(Cancelled));
     };
 
-    // 已完整存在则跳过
+    // 已存在则不覆盖：大小一致视为完成；大小不一致必须显式 --overwrite，
+    // 否则报告失败，避免把用户现有的文件静默替换掉。
     if dest.exists() && !opts.overwrite {
         let existing = tokio::fs::metadata(&dest).await.map(|m| m.len()).ok();
-        if let Some(size) = item.size() {
-            if existing == Some(size) {
+        match item.size() {
+            Some(expected) if existing == Some(expected) => {
                 return Ok(OneResult {
                     skipped: true,
                     ..Default::default()
                 });
             }
-        } else {
-            return Ok(OneResult {
-                skipped: true,
-                ..Default::default()
-            });
+            Some(expected) => bail!(
+                "目标文件已存在但大小不一致（现有 {}，预期 {}），未覆盖；加 --overwrite 覆盖",
+                existing
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "未知".to_string()),
+                format_bytes(expected)
+            ),
+            None => {
+                return Ok(OneResult {
+                    skipped: true,
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -1627,7 +1656,16 @@ pub async fn download_one(
     pb.set_message(item.title());
     let bytes = download_file(&client.http, &urls, &dest, pb, opts, limiter, cancel).await?;
     let subs = if opts.subs {
-        download_subs(client, item, &dest, &rel, limiter.as_ref(), cancel, opts.overwrite).await
+        download_subs(
+            client,
+            item,
+            &dest,
+            &rel,
+            limiter.as_ref(),
+            cancel,
+            opts.overwrite,
+        )
+        .await
     } else {
         0
     };
@@ -1649,13 +1687,103 @@ fn shorten(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("…{}", s.chars().skip(s.chars().count() - max + 1).collect::<String>())
+        format!(
+            "…{}",
+            s.chars()
+                .skip(s.chars().count() - max + 1)
+                .collect::<String>()
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "embydown-download-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 最小 HTTP 媒体服务器：支持 Range、206/Content-Range 和整包 200。
+    async fn mock_media_server(data: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let data = data.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() > 64 * 1024
+                        {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let range = request.lines().find_map(|line| {
+                        line.strip_prefix("Range: bytes=")
+                            .or_else(|| line.strip_prefix("range: bytes="))
+                    });
+                    let total = data.len();
+                    let (start, end, partial) = match range {
+                        Some(range) => {
+                            let (a, b) = range.trim().split_once('-').unwrap_or(("0", ""));
+                            let start =
+                                a.parse::<usize>().unwrap_or(0).min(total.saturating_sub(1));
+                            let end = if b.is_empty() {
+                                total.saturating_sub(1)
+                            } else {
+                                b.parse::<usize>()
+                                    .unwrap_or(total.saturating_sub(1))
+                                    .min(total.saturating_sub(1))
+                            };
+                            (start, end, true)
+                        }
+                        None => (0, total.saturating_sub(1), false),
+                    };
+                    let body = data.get(start..=end).unwrap_or(&[]);
+                    let mut head = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: video/x-matroska\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+                        if partial {
+                            "206 Partial Content"
+                        } else {
+                            "200 OK"
+                        },
+                        body.len()
+                    );
+                    if partial {
+                        head.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
+                    }
+                    head.push_str("\r\n");
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn chunk_layout_is_independent_of_connections() {
@@ -1675,7 +1803,10 @@ mod tests {
     #[test]
     fn retry_after_header_is_parsed() {
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("3211"));
+        h.insert(
+            RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("3211"),
+        );
         assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(3211)));
 
         h.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("0"));
@@ -1741,5 +1872,174 @@ mod tests {
         assert_eq!(chunk_range_len(4, 9, &completed), 5);
         let all: HashSet<u32> = [0, 1, 2].into_iter().collect();
         assert_eq!(chunk_range_len(4, 9, &all), 9);
+    }
+
+    #[tokio::test]
+    async fn chunked_download_round_trips_against_mock_server() {
+        let total = 9 * 1024 * 1024 + 123;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let base = mock_media_server(data.clone()).await;
+        let dir = temp_dir("mock-download");
+        let item = Item {
+            id: "v1".into(),
+            name: Some("示例电影".into()),
+            item_type: Some("Movie".into()),
+            container: Some("mkv".into()),
+            direct_url: Some(format!("{base}/movie.mkv")),
+            media_sources: Some(vec![crate::model::MediaSource {
+                size: Some(total as u64),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let opts = DownloadOpts {
+            out: dir.clone(),
+            connections: 3,
+            jobs: 1,
+            subs: false,
+            ..Default::default()
+        };
+        let client = Client::new(&base, false).unwrap();
+        let result = download_one(
+            &client,
+            &item,
+            &opts,
+            &Arc::new(Limiter::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.skipped);
+        assert_eq!(result.bytes, total as u64);
+        let dest = dir.join("影视/电影/示例电影 (未知年份)/示例电影 (未知年份).mkv");
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert!(!PathBuf::from(format!("{}.part", dest.display())).exists());
+        assert!(!PathBuf::from(format!("{}.part.json", dest.display())).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn single_connection_resume_uses_partial_file() {
+        let total = 2 * 1024 * 1024 + 7;
+        let data: Vec<u8> = (0..total).map(|i| (i % 239) as u8).collect();
+        let base = mock_media_server(data.clone()).await;
+        let dir = temp_dir("resume");
+        let dest = dir.join("movie.mkv");
+        let part = PathBuf::from(format!("{}.part", dest.display()));
+        std::fs::write(&part, &data[..1_000_000]).unwrap();
+
+        let item = Item {
+            id: "v1".into(),
+            name: Some("movie".into()),
+            item_type: Some("Movie".into()),
+            container: Some("mkv".into()),
+            direct_url: Some(format!("{base}/movie.mkv")),
+            media_sources: Some(vec![crate::model::MediaSource {
+                size: Some(total as u64),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let opts = DownloadOpts {
+            out: dir.clone(),
+            fixed_dest: Some(dest.clone()),
+            connections: 1,
+            jobs: 1,
+            subs: false,
+            resume: true,
+            ..Default::default()
+        };
+        let client = Client::new(&base, false).unwrap();
+        let result = download_one(
+            &client,
+            &item,
+            &opts,
+            &Arc::new(Limiter::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.bytes, total as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert!(!part.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn existing_file_with_different_size_is_not_overwritten() {
+        let dir = temp_dir("existing-mismatch");
+        let dest = dir.join("movie.mkv");
+        std::fs::write(&dest, b"old").unwrap();
+        let item = Item {
+            id: "v1".into(),
+            name: Some("movie".into()),
+            item_type: Some("Movie".into()),
+            container: Some("mkv".into()),
+            media_sources: Some(vec![crate::model::MediaSource {
+                size: Some(5),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let opts = DownloadOpts {
+            out: dir.clone(),
+            fixed_dest: Some(dest.clone()),
+            ..Default::default()
+        };
+        let client = Client::new("http://127.0.0.1:1", false).unwrap();
+        let error = download_one(
+            &client,
+            &item,
+            &opts,
+            &Arc::new(Limiter::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("大小不一致"), "{error:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn existing_file_with_matching_size_is_skipped() {
+        let dir = temp_dir("existing-match");
+        let dest = dir.join("movie.mkv");
+        std::fs::write(&dest, b"12345").unwrap();
+        let item = Item {
+            id: "v1".into(),
+            name: Some("movie".into()),
+            item_type: Some("Movie".into()),
+            container: Some("mkv".into()),
+            media_sources: Some(vec![crate::model::MediaSource {
+                size: Some(5),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let opts = DownloadOpts {
+            out: dir.clone(),
+            fixed_dest: Some(dest.clone()),
+            ..Default::default()
+        };
+        let client = Client::new("http://127.0.0.1:1", false).unwrap();
+        let result = download_one(
+            &client,
+            &item,
+            &opts,
+            &Arc::new(Limiter::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &ProgressBar::hidden(),
+        )
+        .await
+        .unwrap();
+        assert!(result.skipped);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"12345");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,6 +1,7 @@
 //! Emby Web API 的数据模型（只声明用得到的字段，全部可选以容忍版本差异）。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -22,6 +23,10 @@ pub struct Item {
     pub production_year: Option<i32>,
     pub run_time_ticks: Option<i64>,
     pub overview: Option<String>,
+    /// 元数据提供方 ID（Emby 的 `ProviderIds`，如 `Tmdb` / `Imdb` / `Tvdb`）。
+    /// Emby 通常返回字符串，个别版本可能返回数字，解析时统一成字符串。
+    #[serde(deserialize_with = "de_provider_ids")]
+    pub provider_ids: Option<BTreeMap<String, String>>,
     /// 服务器上的真实路径（需要管理员或权限足够时才有）
     pub path: Option<String>,
     pub is_folder: Option<bool>,
@@ -37,6 +42,12 @@ pub struct Item {
     /// 非 API 字段：展开剧集时从 Series 容器/路径补全的剧集年份
     #[serde(default)]
     pub series_year: Option<i32>,
+    /// 非 API 字段：所属剧集的 TMDB ID。
+    ///
+    /// 单集自身的 `ProviderIds.Tmdb` 是单集 ID，不能用来命名剧集目录，
+    /// 展开/下载时会从 Series 条目继承或按 `SeriesId` 补查。
+    #[serde(default)]
+    pub series_tmdb_id: Option<String>,
     /// 非 API 字段：多版本时选中的版本名称（用于文件名区分）
     #[serde(default)]
     pub version: Option<String>,
@@ -112,6 +123,31 @@ impl Item {
 
     pub fn title(&self) -> String {
         self.name.clone().unwrap_or_else(|| "untitled".into())
+    }
+
+    /// 按名称（不区分大小写）取元数据提供方 ID；空值视为缺失。
+    pub fn provider_id(&self, name: &str) -> Option<&str> {
+        self.provider_ids
+            .as_ref()?
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// 用于命名模板的 TMDB ID。
+    ///
+    /// 剧集（Episode）返回**所属剧集**的 TMDB ID：单集自身的 TMDB ID
+    /// 会让同一部剧的每一集分散到不同目录，因此缺失时返回 `None`。
+    pub fn tmdb_id(&self) -> Option<&str> {
+        if self.item_type.as_deref() == Some("Episode") {
+            return self
+                .series_tmdb_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+        }
+        self.provider_id("Tmdb")
     }
 
     /// 搜索结果相关性评分（越大越相关）。
@@ -245,6 +281,31 @@ impl Item {
             .map(|(_, e)| e)
             .unwrap_or(0)
     }
+}
+
+/// 容错解析 `ProviderIds`：标准格式是 `{"Tmdb":"12345"}`，但不同
+/// Emby/Jellyfin 版本可能返回数字、`null` 或空串。无法识别的值直接忽略，
+/// 避免整个响应解析失败。
+fn de_provider_ids<'de, D>(deserializer: D) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(map)) = raw else {
+        return Ok(None);
+    };
+    let ids = map
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let id = match value {
+                serde_json::Value::String(s) => s.trim().to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            (!id.is_empty()).then_some((key, id))
+        })
+        .collect();
+    Ok(Some(ids))
 }
 
 /// 搜索比较用的归一化：转小写并去掉空格、标点（保留字母、数字与中文）。
@@ -476,6 +537,47 @@ mod tests {
             ..series_a.clone()
         };
         assert_eq!(series_a.search_group_key(), series_b.search_group_key());
+    }
+
+    #[test]
+    fn parses_provider_ids_tolerantly() {
+        let item: Item = serde_json::from_str(
+            r#"{"Id":"m1","ProviderIds":{"Tmdb":12345,"Imdb":null,"Tvdb":" 42 ","Bad":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(item.provider_id("tmdb"), Some("12345"));
+        assert_eq!(item.provider_id("TVDB"), Some("42"));
+        assert_eq!(item.provider_id("Imdb"), None);
+        assert_eq!(item.provider_id("Bad"), None);
+
+        // 字段缺失或类型异常时不应让整个响应解析失败。
+        let plain: Item = serde_json::from_str(r#"{"Id":"m2","ProviderIds":"oops"}"#).unwrap();
+        assert!(plain.provider_ids.is_none());
+    }
+
+    #[test]
+    fn episode_tmdb_id_uses_series_not_episode_id() {
+        let episode = Item {
+            item_type: Some("Episode".into()),
+            provider_ids: Some(BTreeMap::from([("Tmdb".to_string(), "999".to_string())])),
+            series_tmdb_id: Some("123".into()),
+            ..Default::default()
+        };
+        assert_eq!(episode.tmdb_id(), Some("123"));
+
+        // 单集 ID 不能冒充剧集 ID；缺失时宁可不写。
+        let no_series = Item {
+            series_tmdb_id: None,
+            ..episode.clone()
+        };
+        assert_eq!(no_series.tmdb_id(), None);
+
+        let movie = Item {
+            item_type: Some("Movie".into()),
+            provider_ids: Some(BTreeMap::from([("tmdb".to_string(), "456".to_string())])),
+            ..Default::default()
+        };
+        assert_eq!(movie.tmdb_id(), Some("456"));
     }
 
     #[test]

@@ -67,8 +67,7 @@ pub async fn run(check: bool, version: Option<String>, force: bool) -> Result<()
     }
 
     let asset = format!("embydown-{tag}-{TARGET}.bin");
-    let base = release_base(&tag);
-    let asset_url = format!("{base}/{asset}");
+    let asset_url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
     let checksum_url = format!("{asset_url}.sha256");
 
     let exe = std::env::current_exe().context("无法定位当前可执行文件")?;
@@ -278,17 +277,6 @@ fn install_binary(temp: &Path, exe: &Path) -> Result<()> {
     std::fs::rename(temp, exe)
         .with_context(|| format!("替换 {} 失败（可尝试 sudo 后重试）", exe.display()))?;
     Ok(())
-}
-
-/// Release 下载目录。`EMBYDOWN_RELEASE_BASE` 可指向镜像
-/// （例如 `https://mirror.example.com/embydown/releases/download`）。
-fn release_base(tag: &str) -> String {
-    match std::env::var("EMBYDOWN_RELEASE_BASE") {
-        Ok(base) if !base.trim().is_empty() => {
-            format!("{}/{tag}", base.trim().trim_end_matches('/'))
-        }
-        _ => format!("https://github.com/{REPO}/releases/download/{tag}"),
-    }
 }
 
 fn normalize_tag(input: &str) -> String {

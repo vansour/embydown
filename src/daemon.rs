@@ -7,7 +7,7 @@
 //!
 //! 单实例：socket + `daemon.lock`（PID 锁）双重保证不会重复下载同一批文件。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -131,8 +131,8 @@ pub async fn run() -> Result<()> {
 
     // 拿到单实例锁后，残留的 socket 一定是上次异常退出留下的。
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("监听 {} 失败", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("监听 {} 失败", socket.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
 
@@ -179,7 +179,7 @@ async fn serve(stream: UnixStream, manager: Arc<Manager>) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(req, &manager),
+            Ok(req) => handle(req, &manager).await,
             Err(e) => Response::err(format!("无法解析请求: {e}")),
         };
         let mut out = serde_json::to_vec(&response).context("序列化响应失败")?;
@@ -190,7 +190,7 @@ async fn serve(stream: UnixStream, manager: Arc<Manager>) -> Result<()> {
     Ok(())
 }
 
-fn handle(req: Request, manager: &Manager) -> Response {
+async fn handle(req: Request, manager: &Manager) -> Response {
     match req {
         Request::Enqueue {
             server,
@@ -267,10 +267,10 @@ fn handle(req: Request, manager: &Manager) -> Response {
             manager.resume_all();
             Response::ok()
         }
-        Request::ClearHistory => {
-            manager.clear_finished();
-            Response::ok()
-        }
+        Request::ClearHistory => match manager.clear_finished().await {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::err(e),
+        },
         Request::Snapshot => Response::state(manager.snapshot()),
         Request::Ping => Response::ok(),
     }
@@ -318,9 +318,7 @@ fn acquire_instance_lock(path: &Path) -> Result<Option<InstanceLock>> {
                 }
                 return Ok(None);
             }
-            Err(e) => {
-                return Err(e).with_context(|| format!("创建锁文件失败: {}", path.display()))
-            }
+            Err(e) => return Err(e).with_context(|| format!("创建锁文件失败: {}", path.display())),
         }
     }
     Ok(None)
@@ -391,10 +389,7 @@ impl DaemonHandle {
 
     /// 取出并清空最近一次后台通信错误（由交互模式状态栏显示）。
     pub fn take_error(&self) -> Option<String> {
-        self.error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn send(&self, req: Request) {
@@ -503,6 +498,11 @@ pub async fn cli_resume(server: Option<&str>) -> Result<()> {
         None => Request::ResumeAll,
     })
     .await
+}
+
+/// CLI：清空下载记录、累计统计与历史文件（不中断正在下载的任务）。
+pub async fn cli_clear_history() -> Result<()> {
+    send_cli(Request::ClearHistory).await
 }
 
 async fn send_cli(request: Request) -> Result<()> {
@@ -774,7 +774,10 @@ mod tests {
         match back {
             Request::Enqueue { items, client, .. } => {
                 assert_eq!(items[0].title(), "电影");
-                assert_eq!(items[0].direct_url.as_deref(), Some("http://host/x?api_key=k"));
+                assert_eq!(
+                    items[0].direct_url.as_deref(),
+                    Some("http://host/x?api_key=k")
+                );
                 assert_eq!(client.token, "t");
             }
             _ => panic!("unexpected request"),
@@ -825,5 +828,44 @@ mod tests {
     fn process_is_running_checks_proc_state() {
         assert!(process_is_running(std::process::id()));
         assert!(!process_is_running(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn unix_socket_protocol_round_trips() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+
+        let (server, client) = UnixStream::pair().unwrap();
+        let manager = Arc::new(Manager::for_test());
+        let task = tokio::spawn(serve(server, manager));
+
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        writer.write_all(b"{\"op\":\"ping\"}\n").await.unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.protocol, Some(PROTOCOL_VERSION));
+
+        writer.write_all(b"{\"op\":\"snapshot\"}\n").await.unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(response.ok);
+        assert!(response.state.is_some());
+
+        writer.write_all(b"not-json\n").await.unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("无法解析请求"));
+
+        drop(writer);
+        drop(lines);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

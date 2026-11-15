@@ -1,14 +1,14 @@
 //! Emby Web API 客户端：认证、浏览、直链构造。
 
-use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, RETRY_AFTER};
+use anyhow::{Context, Result, bail};
 use reqwest::Url;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::model::{AuthRequest, AuthResult, Item, MediaStream, QueryResult, User};
-use crate::util::{vlog, verbose};
+use crate::util::{verbose, vlog};
 
 pub const CLIENT_NAME: &str = "embydown";
 
@@ -99,20 +99,51 @@ impl Client {
     }
 
     /// 拼接 URL 并追加查询参数（自动带上 `api_key`）。
+    ///
+    /// 路径本身已经带 `api_key` 时不再重复追加（例如服务器返回的
+    /// `DeliveryUrl` 可能已经签好名）。
     pub fn build_url(&self, path: &str, query: &[(&str, String)]) -> String {
         let base = format!("{}{}", self.server, path);
         let mut url = match Url::parse(&base) {
             Ok(u) => u,
             Err(_) => return base,
         };
+        let has_api_key = url
+            .query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("api_key"));
         {
             let mut qp = url.query_pairs_mut();
-            if !self.token.is_empty() {
+            if !self.token.is_empty() && !has_api_key {
                 qp.append_pair("api_key", &self.token);
             }
             for (k, v) in query {
                 qp.append_pair(k, v);
             }
+        }
+        url.to_string()
+    }
+
+    /// 处理绝对 URL（例如 Emby 返回的跨主机字幕 `DeliveryUrl`）。
+    ///
+    /// 同主机时补上 `api_key`；跨主机时保持原样，避免把当前服务器的访问
+    /// 令牌泄漏给第三方 CDN。相对路径仍由 [`Self::build_url`] 拼接服务器地址。
+    fn absolute_url(&self, raw: &str) -> String {
+        let Ok(mut url) = Url::parse(raw) else {
+            return raw.to_string();
+        };
+        let same_host = Url::parse(&self.server).ok().is_some_and(|server| {
+            url.host_str()
+                .zip(server.host_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                && url.port_or_known_default() == server.port_or_known_default()
+        });
+        if same_host
+            && !self.token.is_empty()
+            && !url
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("api_key"))
+        {
+            url.query_pairs_mut().append_pair("api_key", &self.token);
         }
         url.to_string()
     }
@@ -188,21 +219,38 @@ impl Client {
         self.user_id = picked.id.clone();
         vlog(
             2,
-            format!("当前用户（/Users 回退）: {:?} admin={:?}", picked.name, picked.is_administrator),
+            format!(
+                "当前用户（/Users 回退）: {:?} admin={:?}",
+                picked.name, picked.is_administrator
+            ),
         );
         Ok(())
     }
 
-    async fn try_get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Option<T> {
+    async fn try_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Option<T> {
         let url = self.api_url(path, query);
-        let resp = self.http.get(&url).headers(self.headers().ok()?).send().await.ok()?;
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.headers().ok()?)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
         resp.json::<T>().await.ok()
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
+    pub async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T> {
         let url = self.api_url(path, query);
         let mut attempt = 0u32;
         loop {
@@ -365,7 +413,9 @@ impl Client {
 
         let mut urls = Vec::new();
         match item.item_type.as_deref() {
-            Some("Audio") => urls.push(self.build_url(&format!("/Audio/{}/stream", item.id), &common)),
+            Some("Audio") => {
+                urls.push(self.build_url(&format!("/Audio/{}/stream", item.id), &common))
+            }
             _ => {
                 urls.push(self.build_url(&format!("/Videos/{}/stream", item.id), &common));
                 urls.push(self.build_url(
@@ -391,15 +441,25 @@ impl Client {
     pub fn subtitle_urls(&self, item: &Item, stream: &MediaStream) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(d) = &stream.delivery_url {
-            let joined = if d.starts_with("http://") || d.starts_with("https://") {
-                d.clone()
-            } else {
-                format!("{}{}", self.server, if d.starts_with('/') { d.clone() } else { format!("/{}", d) })
-            };
-            out.push(self.build_url(
-                joined.trim_start_matches(&self.server),
-                &[],
-            ));
+            let d = d.trim();
+            if d.starts_with("http://") || d.starts_with("https://") {
+                out.push(self.absolute_url(d));
+            } else if let Some(rest) = d.strip_prefix("//") {
+                // 协议相对 URL：沿用服务器自身的 scheme。
+                let scheme = if self.server.starts_with("https://") {
+                    "https:"
+                } else {
+                    "http:"
+                };
+                out.push(self.absolute_url(&format!("{scheme}//{rest}")));
+            } else if !d.is_empty() {
+                let path = if d.starts_with('/') {
+                    d.to_string()
+                } else {
+                    format!("/{d}")
+                };
+                out.push(self.build_url(&path, &[]));
+            }
         }
         let idx = stream.index.unwrap_or(0);
         // 用标准字幕后缀构造 URL：codec 常是 `subrip`，直接当扩展名会生成
@@ -407,17 +467,19 @@ impl Client {
         let codec = crate::naming::subtitle_ext(stream.codec.as_deref());
         if let Some(ms) = item.media_source_id() {
             out.push(self.build_url(
-                &format!("/Videos/{}/{}/Subtitles/{}/Stream.{}", item.id, ms, idx, codec),
+                &format!(
+                    "/Videos/{}/{}/Subtitles/{}/Stream.{}",
+                    item.id, ms, idx, codec
+                ),
                 &[],
             ));
         }
         out.dedup();
         out
     }
-
 }
 
-const FIELDS: &str = "MediaSources,MediaStreams,Path,Overview,ProductionYear,ParentId,SeriesId,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,RunTimeTicks,DateCreated,BasicSyncInfo";
+const FIELDS: &str = "MediaSources,MediaStreams,Path,Overview,ProductionYear,ParentId,SeriesId,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,RunTimeTicks,DateCreated,BasicSyncInfo,ProviderIds";
 
 /// 规范化服务器地址：补 scheme、去尾斜杠、去多余空白。
 pub fn normalize_server(input: &str) -> Result<String> {
@@ -492,7 +554,10 @@ pub fn redact_text(input: &str) -> String {
         let after = &rest[pos + len..];
         let end = after
             .find(|c: char| {
-                c == '&' || c == '#' || c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>' | ']')
+                c == '&'
+                    || c == '#'
+                    || c.is_whitespace()
+                    || matches!(c, ')' | '"' | '\'' | '>' | ']')
             })
             .unwrap_or(after.len());
         rest = &after[end..];
@@ -559,5 +624,65 @@ mod tests {
         assert!(!urls.iter().any(|u| u.contains("/Items/v1/Download")));
         assert!(!urls.iter().any(|u| u.contains("/Items/v1/File")));
         assert!(urls.iter().all(|u| u.contains("MediaSourceId=ms1")));
+    }
+
+    #[test]
+    fn build_url_does_not_duplicate_api_key() {
+        let mut client = Client::new("https://media.example.com", false).unwrap();
+        client.token = "new".into();
+        let url = client.build_url("/Videos/v1/stream?api_key=old", &[]);
+        assert_eq!(url.matches("api_key=").count(), 1, "{url}");
+        assert!(url.contains("api_key=old"), "{url}");
+    }
+
+    #[test]
+    fn subtitle_delivery_urls_handle_absolute_hosts_without_leaking_tokens() {
+        let mut client = Client::new("https://media.example.com", false).unwrap();
+        client.token = "secret".into();
+        let item = Item {
+            id: "v1".into(),
+            media_sources: Some(vec![MediaSource {
+                id: Some("ms1".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        // 跨主机绝对 URL 必须保持原样，不能拼上当前服务器，也不能带上 token。
+        let cross = MediaStream {
+            delivery_url: Some("https://cdn.example.net/sub.srt".into()),
+            ..Default::default()
+        };
+        let urls = client.subtitle_urls(&item, &cross);
+        assert_eq!(urls[0], "https://cdn.example.net/sub.srt");
+
+        // 同主机绝对 URL 补 api_key。
+        let same = MediaStream {
+            delivery_url: Some("https://media.example.com/Videos/v1/sub.srt".into()),
+            ..Default::default()
+        };
+        let urls = client.subtitle_urls(&item, &same);
+        assert!(urls[0].contains("api_key=secret"), "{}", urls[0]);
+
+        // 相对路径正常拼接服务器地址与 api_key。
+        let relative = MediaStream {
+            delivery_url: Some("/Videos/v1/ms1/Subtitles/2/Stream.srt".into()),
+            ..Default::default()
+        };
+        let urls = client.subtitle_urls(&item, &relative);
+        assert!(
+            urls[0].starts_with("https://media.example.com/Videos/v1/ms1/Subtitles/2/Stream.srt"),
+            "{}",
+            urls[0]
+        );
+        assert!(urls[0].contains("api_key=secret"), "{}", urls[0]);
+
+        // 已经带 api_key 的 URL 不重复追加。
+        let signed = MediaStream {
+            delivery_url: Some("https://media.example.com/sub.srt?api_key=old".into()),
+            ..Default::default()
+        };
+        let urls = client.subtitle_urls(&item, &signed);
+        assert_eq!(urls[0].matches("api_key=").count(), 1, "{}", urls[0]);
     }
 }

@@ -1,12 +1,19 @@
 //! 文件命名模板。
 //!
 //! 支持占位符：`{title} {series} {season} {season00} {season5} {episode}
-//! {episode00} {episode5} {year} {seriesyear} {version} {ext} {type} {id} {container}`。
+//! {episode00} {episode5} {year} {seriesyear} {tmdbid} {tmdbidtag} {version}
+//! {ext} {type} {id} {container}`。
+//!
+//! `{season00}` / `{episode00}` 至少两位补零，超过 99 时自动使用实际位数
+//! （99 → `99`，100 → `100`）；`{season5}` / `{episode5}` 固定五位。
+//!
+//! `{tmdbid}` 输出 TMDB ID（剧集为所属剧集的 ID，缺失时为空）；
+//! `{tmdbidtag}` 输出 ` [tmdbid-123]`（缺失时为空，不会留下空括号）。
 
 use crate::model::{Item, MediaSource};
 use crate::util::{sanitize_component, sanitize_path, truncate_component};
 
-pub fn default_pattern(item: &Item) -> &'static str {
+pub fn default_pattern(item: &Item) -> String {
     // 只有本次同时下载多个版本（--version all）时才用版本目录，
     // 避免单版本下载出现 `[Nekomoe kissaten@LoliHouse]` 之类的多余层级。
     let scoped = item.version_scoped
@@ -15,25 +22,39 @@ pub fn default_pattern(item: &Item) -> &'static str {
             .as_deref()
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
+    // Emby/Jellyfin 支持在名称后追加 `[tmdbid-123]` 提升识别准确率。
+    // 剧集使用所属剧集的 TMDB ID；取不到时整段省略，避免出现空括号。
+    let tag = tmdb_tag(item);
+    let series_dir = format!("{{series}} ({{seriesyear}}){tag}");
+    let movie_name = format!("{{title}} ({{year}}){tag}");
     match item.item_type.as_deref() {
-        // Emby/Jellyfin 标准剧集结构：剧名 (年份)/Season 00001/剧名 - S00001E00001.ext
-        Some("Episode") if scoped => {
-            "影视/剧集/{series} ({seriesyear}) [{version}]/Season {season5}/{series} - S{season5}E{episode5}.{ext}"
-        }
-        Some("Episode") => {
-            "影视/剧集/{series} ({seriesyear})/Season {season5}/{series} - S{season5}E{episode5}.{ext}"
-        }
-        // Emby 标准电影结构：电影名 (年份)/电影名 (年份).ext
+        // Emby/Jellyfin 标准剧集结构：剧名 (年份) [tmdbid-123]/Season 01/剧名 - S01E01.ext
+        // 季/集默认两位补零，超过 99 时自动扩展为三位（Season 100 / S100E100）。
+        Some("Episode") if scoped => format!(
+            "影视/剧集/{series_dir} [{{version}}]/Season {{season00}}/{{series}} - S{{season00}}E{{episode00}}.{{ext}}"
+        ),
+        Some("Episode") => format!(
+            "影视/剧集/{series_dir}/Season {{season00}}/{{series}} - S{{season00}}E{{episode00}}.{{ext}}"
+        ),
+        // Emby 标准电影结构：电影名 (年份) [tmdbid-123]/电影名 (年份) [tmdbid-123].ext
         Some("Movie") if scoped => {
-            "影视/电影/{title} ({year}) [{version}]/{title} ({year}).{ext}"
+            format!("影视/电影/{movie_name} [{{version}}]/{movie_name}.{{ext}}")
         }
-        Some("Movie") => "影视/电影/{title} ({year})/{title} ({year}).{ext}",
+        Some("Movie") => format!("影视/电影/{movie_name}/{movie_name}.{{ext}}"),
         // 音频/其他类型（Video、MusicVideo、Trailer…）也必须带版本目录，
         // 否则 --version all 时多个版本会解析到同一路径互相覆盖。
-        Some("Audio") if scoped => "影视/音乐/{title} [{version}]/{title}.{ext}",
-        Some("Audio") => "影视/音乐/{title}.{ext}",
-        _ if scoped => "影视/其他/{title} [{version}]/{title}.{ext}",
-        _ => "影视/其他/{title}.{ext}",
+        Some("Audio") if scoped => "影视/音乐/{title} [{version}]/{title}.{ext}".to_string(),
+        Some("Audio") => "影视/音乐/{title}.{ext}".to_string(),
+        _ if scoped => "影视/其他/{title} [{version}]/{title}.{ext}".to_string(),
+        _ => "影视/其他/{title}.{ext}".to_string(),
+    }
+}
+
+/// ` [tmdbid-123]`：没有 TMDB ID 时返回空串，模板里不会留下空括号。
+fn tmdb_tag(item: &Item) -> String {
+    match item.tmdb_id() {
+        Some(id) => format!(" [tmdbid-{id}]"),
+        None => String::new(),
     }
 }
 
@@ -234,10 +255,12 @@ fn strip_year_parens(s: &str) -> String {
     out
 }
 
+/// 至少两位补零；超过 99 时按实际位数输出（99 → `99`，100 → `100`）。
 fn pad2(n: i32) -> String {
     format!("{:02}", n.max(0))
 }
 
+/// 固定五位补零。
 fn pad5(n: i32) -> String {
     format!("{:05}", n.max(0))
 }
@@ -309,7 +332,7 @@ pub fn render(pattern: &str, item: &Item, ext: &str) -> String {
     let season = item.season_no();
     let episode = item.episode_no();
 
-    let vars: [(&str, String); 15] = [
+    let vars: [(&str, String); 17] = [
         ("title", title.clone()),
         ("series", series.clone()),
         ("season", season.to_string()),
@@ -320,6 +343,8 @@ pub fn render(pattern: &str, item: &Item, ext: &str) -> String {
         ("episode5", pad5(episode)),
         ("year", year),
         ("seriesyear", series_year),
+        ("tmdbid", item.tmdb_id().unwrap_or_default().to_string()),
+        ("tmdbidtag", tmdb_tag(item)),
         ("version", item.version.clone().unwrap_or_default()),
         ("ext", ext.to_string()),
         ("type", item.display_type().to_string()),
@@ -403,6 +428,7 @@ pub fn subtitle_ext(codec: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn episode() -> Item {
         Item {
@@ -421,11 +447,30 @@ mod tests {
     #[test]
     fn renders_episode_path() {
         let item = episode();
-        let rel = render(default_pattern(&item), &item, "mkv");
-        assert_eq!(
-            rel,
-            "影视/剧集/示例剧 (2023)/Season 00001/示例剧 - S00001E00002.mkv"
-        );
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(rel, "影视/剧集/示例剧 (2023)/Season 01/示例剧 - S01E02.mkv");
+    }
+
+    #[test]
+    fn season_and_episode_pad_to_two_then_expand() {
+        let pattern = "{season00}/{episode00}/S{season00}E{episode00}.{ext}";
+        let mut item = episode();
+
+        item.parent_index_number = Some(9);
+        item.index_number = Some(9);
+        assert_eq!(render(pattern, &item, "mkv"), "09/09/S09E09.mkv");
+
+        item.parent_index_number = Some(99);
+        item.index_number = Some(99);
+        assert_eq!(render(pattern, &item, "mkv"), "99/99/S99E99.mkv");
+
+        item.parent_index_number = Some(100);
+        item.index_number = Some(120);
+        assert_eq!(render(pattern, &item, "mkv"), "100/120/S100E120.mkv");
+
+        item.parent_index_number = Some(1000);
+        item.index_number = Some(1001);
+        assert_eq!(render(pattern, &item, "mkv"), "1000/1001/S1000E1001.mkv");
     }
 
     #[test]
@@ -438,15 +483,87 @@ mod tests {
             container: Some("mp4".into()),
             ..Default::default()
         };
-        let rel = render(default_pattern(&item), &item, "mp4");
+        let rel = render(&default_pattern(&item), &item, "mp4");
         assert_eq!(rel, "影视/电影/101次求婚 (2013)/101次求婚 (2013).mp4");
+    }
+
+    #[test]
+    fn movie_path_includes_tmdb_tag() {
+        let item = Item {
+            id: "m4".into(),
+            name: Some("瞬息全宇宙".into()),
+            item_type: Some("Movie".into()),
+            production_year: Some(2022),
+            container: Some("mkv".into()),
+            provider_ids: Some(BTreeMap::from([("Tmdb".to_string(), "545611".to_string())])),
+            ..Default::default()
+        };
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(
+            rel,
+            "影视/电影/瞬息全宇宙 (2022) [tmdbid-545611]/瞬息全宇宙 (2022) [tmdbid-545611].mkv"
+        );
+    }
+
+    #[test]
+    fn series_folder_uses_series_tmdb_not_episode_tmdb() {
+        let mut item = episode();
+        item.provider_ids = Some(BTreeMap::from([("Tmdb".to_string(), "99999".to_string())]));
+        item.series_tmdb_id = Some("456".into());
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(
+            rel,
+            "影视/剧集/示例剧 (2023) [tmdbid-456]/Season 01/示例剧 - S01E02.mkv"
+        );
+
+        // 没有剧集 TMDB ID 时不使用单集 ID，也不留下空括号。
+        item.series_tmdb_id = None;
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(rel, "影视/剧集/示例剧 (2023)/Season 01/示例剧 - S01E02.mkv");
+    }
+
+    #[test]
+    fn tmdb_placeholders_render_and_collapse() {
+        let mut item = episode();
+        item.series_tmdb_id = Some("456".into());
+        assert_eq!(
+            render("{title}{tmdbidtag}", &item, "mkv"),
+            "试播集_ 一切开始 [tmdbid-456]"
+        );
+        assert_eq!(render("{tmdbid}", &item, "mkv"), "456");
+
+        item.series_tmdb_id = None;
+        assert_eq!(
+            render("{title}{tmdbidtag}", &item, "mkv"),
+            "试播集_ 一切开始"
+        );
+    }
+
+    #[test]
+    fn scoped_movie_keeps_tmdb_tag_before_version() {
+        let item = Item {
+            id: "m5".into(),
+            name: Some("杯雪·一战成名".into()),
+            item_type: Some("Movie".into()),
+            production_year: Some(2026),
+            container: Some("mkv".into()),
+            provider_ids: Some(BTreeMap::from([("Tmdb".to_string(), "888".to_string())])),
+            version: Some("2160p".into()),
+            version_scoped: true,
+            ..Default::default()
+        };
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(
+            rel,
+            "影视/电影/杯雪·一战成名 (2026) [tmdbid-888] [2160p]/杯雪·一战成名 (2026) [tmdbid-888].mkv"
+        );
     }
 
     #[test]
     fn long_chinese_name_fits_name_max() {
         let mut item = episode();
         item.name = Some("很长的标题".repeat(40)); // 200 字 = 600 字节
-        let rel = render(default_pattern(&item), &item, "mkv");
+        let rel = render(&default_pattern(&item), &item, "mkv");
         let last = rel.rsplit('/').next().unwrap();
         assert!(last.len() <= 220, "单段 {} 字节，超过 NAME_MAX", last.len());
     }
@@ -472,10 +589,10 @@ mod tests {
             container: Some("mp4".into()),
             ..Default::default()
         };
-        let rel = render(default_pattern(&item), &item, "mp4");
+        let rel = render(&default_pattern(&item), &item, "mp4");
         assert_eq!(
             rel,
-            "影视/剧集/葬送的芙莉莲 (2023)/Season 00001/葬送的芙莉莲 - S00001E00016.mp4"
+            "影视/剧集/葬送的芙莉莲 (2023)/Season 01/葬送的芙莉莲 - S01E16.mp4"
         );
     }
 
@@ -483,11 +600,8 @@ mod tests {
     fn single_version_selection_has_no_version_dir() {
         let mut item = episode();
         item.version = Some("Nekomoe kissaten@LoliHouse".into());
-        let rel = render(default_pattern(&item), &item, "mkv");
-        assert_eq!(
-            rel,
-            "影视/剧集/示例剧 (2023)/Season 00001/示例剧 - S00001E00002.mkv"
-        );
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(rel, "影视/剧集/示例剧 (2023)/Season 01/示例剧 - S01E02.mkv");
     }
 
     #[test]
@@ -495,11 +609,8 @@ mod tests {
         let mut item = episode();
         item.version = Some("  ".into());
         item.version_scoped = true;
-        let rel = render(default_pattern(&item), &item, "mkv");
-        assert_eq!(
-            rel,
-            "影视/剧集/示例剧 (2023)/Season 00001/示例剧 - S00001E00002.mkv"
-        );
+        let rel = render(&default_pattern(&item), &item, "mkv");
+        assert_eq!(rel, "影视/剧集/示例剧 (2023)/Season 01/示例剧 - S01E02.mkv");
     }
 
     #[test]
@@ -507,10 +618,10 @@ mod tests {
         let mut item = episode();
         item.version = Some("Nekomoe kissaten@LoliHouse".into());
         item.version_scoped = true;
-        let rel = render(default_pattern(&item), &item, "mkv");
+        let rel = render(&default_pattern(&item), &item, "mkv");
         assert_eq!(
             rel,
-            "影视/剧集/示例剧 (2023) [Nekomoe kissaten@LoliHouse]/Season 00001/示例剧 - S00001E00002.mkv"
+            "影视/剧集/示例剧 (2023) [Nekomoe kissaten@LoliHouse]/Season 01/示例剧 - S01E02.mkv"
         );
     }
 
@@ -526,7 +637,7 @@ mod tests {
             version_scoped: true,
             ..Default::default()
         };
-        let rel = render(default_pattern(&item), &item, "mkv");
+        let rel = render(&default_pattern(&item), &item, "mkv");
         assert_eq!(
             rel,
             "影视/电影/杯雪·一战成名 (2026) [2160p - WEB-DL HDR]/杯雪·一战成名 (2026).mkv"
@@ -544,7 +655,7 @@ mod tests {
             version: Some("2160p - WEB-DL HDR".into()),
             ..Default::default()
         };
-        let rel = render(default_pattern(&item), &item, "mkv");
+        let rel = render(&default_pattern(&item), &item, "mkv");
         assert_eq!(rel, "影视/电影/杯雪·一战成名 (2026)/杯雪·一战成名 (2026).mkv");
     }
 

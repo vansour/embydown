@@ -26,6 +26,10 @@ pub const STATE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: u64,
+    /// 入队批次：同一次 enqueue 的任务共享并发/限速参数。
+    /// 旧版队列文件没有该字段，恢复时全部归入批次 0。
+    #[serde(default)]
+    pub batch: u64,
     pub title: String,
     pub item: Item,
     pub opts: DownloadOpts,
@@ -184,8 +188,7 @@ pub fn append_history(entry: &Finished) -> Result<()> {
 
 pub fn append_history_to(path: &Path, entry: &Finished, time_unix: u64) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("创建目录失败: {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("创建目录失败: {}", dir.display()))?;
     }
     let record = HistoryRecord {
         time_unix,
@@ -260,6 +263,7 @@ mod tests {
     fn job(id: u64) -> JobRecord {
         JobRecord {
             id,
+            batch: id,
             title: format!("任务 {id}"),
             item: Item {
                 id: format!("item{id}"),
@@ -306,10 +310,15 @@ mod tests {
         let back = load_state_from(&path).unwrap();
         assert_eq!(back.seq, 7);
         let srv = &back.servers["srv"];
-        assert_eq!(srv.queue[0].item.direct_url.as_deref(), Some("http://host/Videos/8/stream?api_key=secret"));
+        assert_eq!(srv.queue[0].batch, 8);
+        assert_eq!(
+            srv.queue[0].item.direct_url.as_deref(),
+            Some("http://host/Videos/8/stream?api_key=secret")
+        );
         assert_eq!(srv.queue[0].item.version.as_deref(), Some("1080p"));
         assert!(srv.queue[0].item.source_locked);
         assert_eq!(srv.active[0].id, 9);
+        assert_eq!(srv.active[0].batch, 9);
         assert_eq!(srv.bytes, 42);
         assert!(srv.paused);
         assert!(srv.creds.as_ref().unwrap().insecure);
@@ -349,7 +358,10 @@ mod tests {
         append_history_to(&path, &entry, 1_700_000_001).unwrap();
 
         // 模拟写入中断留下的半行。
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(b"{\"time_unix\":12").unwrap();
         drop(file);
 

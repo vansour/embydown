@@ -20,7 +20,7 @@ use crate::config::{self, Config, Profile, Settings};
 use crate::daemon::DaemonHandle;
 use crate::download::DownloadOpts;
 use crate::emby::Client;
-use crate::manager::{Finished, FinishedStatus, Snapshot};
+use crate::manager::{Finished, FinishedStatus, ServerView, Snapshot};
 use crate::model::Item;
 use crate::repair;
 use crate::table::{Align, Table};
@@ -146,16 +146,13 @@ impl App {
         };
         print_key_value("服务器", &servers);
         print_key_value("搜索范围", self.scope.as_deref().unwrap_or("全部服务器"));
-        let temp = self.cfg.settings.temp_dir.trim();
-        let temp = if temp.is_empty() { "./downloads" } else { temp };
-        print_key_value("临时文件夹", &truncate_display(temp, 52));
-        let final_dir = self.cfg.settings.final_dir.trim();
-        let final_dir = if final_dir.is_empty() {
-            "（未设置）"
+        let download_dir = self.cfg.settings.download_dir.trim();
+        let download_dir = if download_dir.is_empty() {
+            "./downloads"
         } else {
-            final_dir
+            download_dir
         };
-        print_key_value("最终文件夹", &truncate_display(final_dir, 52));
+        print_key_value("下载文件夹", &truncate_display(download_dir, 52));
         let queue = self.queue_summary();
         print_key_value("下载服务", &queue);
         print_rule(60);
@@ -163,9 +160,6 @@ impl App {
 
     fn queue_summary(&self) -> String {
         let state = self.daemon.state();
-        if state.servers.is_empty() {
-            return "空闲".to_string();
-        }
         let active: usize = state
             .servers
             .values()
@@ -181,6 +175,13 @@ impl App {
             .values()
             .filter(|server| server.paused)
             .count();
+        if active == 0 && queued == 0 {
+            return if paused > 0 {
+                format!("{paused} 已暂停")
+            } else {
+                "空闲".to_string()
+            };
+        }
         let mut parts = vec![format!("{active} 下载中"), format!("{queued} 排队")];
         if paused > 0 {
             parts.push(format!("{paused} 已暂停"));
@@ -208,13 +209,12 @@ impl App {
                 ("6)", "未完成任务找回"),
                 ("7)", "下载记录"),
                 ("8)", "本地审查"),
-                ("9)", "同步到最终文件夹"),
                 ("0)", "退出"),
             ]);
             println!();
             println!("{}", dim("输入编号后回车；0 返回/退出，Ctrl+C 随时退出。"));
 
-            let Some(choice) = prompt("选择 [0-9]：")? else {
+            let Some(choice) = prompt("选择 [0-8]：")? else {
                 break;
             };
             match choice.as_str() {
@@ -226,16 +226,7 @@ impl App {
                 "6" => run_step(self.unfinished_menu()).await,
                 "7" => run_step(self.history_menu()).await,
                 "8" => {
-                    if let Err(e) = crate::review::run(None, None, false) {
-                        println!(
-                            "{} {}",
-                            red("✗"),
-                            crate::emby::redact_text(&format!("{e:#}"))
-                        );
-                    }
-                }
-                "9" => {
-                    if let Err(e) = self.sync_menu() {
+                    if let Err(e) = crate::review::run(None) {
                         println!(
                             "{} {}",
                             red("✗"),
@@ -402,9 +393,10 @@ impl App {
             let client = client.clone();
             let term = term.to_string();
             async move {
-                let result = tokio::time::timeout(SEARCH_TIMEOUT, client.search(&term, SEARCH_LIMIT))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("搜索超时")));
+                let result =
+                    tokio::time::timeout(SEARCH_TIMEOUT, client.search(&term, SEARCH_LIMIT))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("搜索超时")));
                 (name, result)
             }
         }))
@@ -459,7 +451,10 @@ impl App {
                 .await
                 .with_context(|| format!("解析 {} 失败", root.title()))?
         } else {
-            vec![root.clone()]
+            let mut files = vec![root.clone()];
+            // 单集直接下载时补上所属剧集的 TMDB ID，供默认命名使用。
+            crate::enrich_series_tmdb(&client, &mut files).await;
+            files
         };
         if files.is_empty() {
             println!("{} 没有可下载的条目", yellow("!"));
@@ -497,7 +492,7 @@ impl App {
         print_rule(60);
         print_key_value("服务器", &server);
         print_key_value("文件", &format!("{} 个，共 {total}", files.len()));
-        print_key_value("临时文件夹", &opts.out.display().to_string());
+        print_key_value("下载文件夹", &opts.out.display().to_string());
         print_rule(60);
         if !confirm("加入后台下载队列？", true)? {
             println!("{} 已取消", yellow("!"));
@@ -795,9 +790,12 @@ impl App {
                 }
                 "e" => self.show_failures()?,
                 "C" => {
-                    if confirm("清空最近完成记录并删除历史文件？", false)? {
+                    if confirm(
+                        "清空最近完成记录、累计统计并删除历史文件？（正在下载的任务完成后仍会新增记录）",
+                        false,
+                    )? {
                         notice = match self.daemon.clear_finished().await {
-                            Ok(()) => Some(format!("{} 已清空下载记录", green("✓"))),
+                            Ok(()) => Some(format!("{} 已清空下载记录与累计统计", green("✓"))),
                             Err(e) => Some(format!(
                                 "{} {}",
                                 red("✗"),
@@ -898,12 +896,18 @@ impl App {
 
     fn print_queue(&self) {
         let state = self.daemon.state();
-        if state.servers.is_empty() && state.finished.is_empty() {
+        // 没有任何任务、统计和暂停状态的历史服务器不占用队列表格。
+        let servers: Vec<(&String, &ServerView)> = state
+            .servers
+            .iter()
+            .filter(|(_, server)| server_view_visible(server))
+            .collect();
+        if servers.is_empty() && state.finished.is_empty() {
             println!("  {}", dim("（暂无下载任务）"));
             return;
         }
 
-        if !state.servers.is_empty() {
+        if !servers.is_empty() {
             let mut table = Table::new(&[
                 "服务器",
                 "状态",
@@ -920,15 +924,10 @@ impl App {
             .align(5, Align::Right)
             .align(6, Align::Right)
             .align(7, Align::Right);
-            for (name, server) in &state.servers {
+            for (name, server) in servers {
                 table.row(vec![
                     name.clone(),
-                    if server.paused {
-                        "已暂停"
-                    } else {
-                        "运行中"
-                    }
-                    .to_string(),
+                    server_view_status(server).to_string(),
                     server.active.len().to_string(),
                     server.queue.len().to_string(),
                     server.done.to_string(),
@@ -1214,15 +1213,10 @@ impl App {
         loop {
             print_section("下载设置");
             let s = &self.cfg.settings;
-            let temp = if s.temp_dir.trim().is_empty() {
+            let download_dir = if s.download_dir.trim().is_empty() {
                 "./downloads"
             } else {
-                s.temp_dir.trim()
-            };
-            let final_dir = if s.final_dir.trim().is_empty() {
-                "（未设置）"
-            } else {
-                s.final_dir.trim()
+                s.download_dir.trim()
             };
             let limit = if s.limit.trim().is_empty() {
                 "不限".to_string()
@@ -1235,15 +1229,14 @@ impl App {
                 truncate_display(s.pattern.trim(), 48)
             };
             let rows = [
-                ("1", "临时文件夹（下载目录）", temp.to_string()),
-                ("2", "最终文件夹（同步目标）", final_dir.to_string()),
-                ("3", "每文件连接数", s.connections.to_string()),
-                ("4", "每服务器并发", s.jobs.to_string()),
-                ("5", "限速", limit),
-                ("6", "下载外挂字幕", on_off(s.subs).to_string()),
-                ("7", "覆盖已存在文件", on_off(s.overwrite).to_string()),
-                ("8", "断点续传", on_off(s.resume).to_string()),
-                ("9", "命名模板", pattern),
+                ("1", "下载文件夹", download_dir.to_string()),
+                ("2", "每文件连接数", s.connections.to_string()),
+                ("3", "每服务器并发", s.jobs.to_string()),
+                ("4", "限速", limit),
+                ("5", "下载外挂字幕", on_off(s.subs).to_string()),
+                ("6", "覆盖已存在文件", on_off(s.overwrite).to_string()),
+                ("7", "断点续传", on_off(s.resume).to_string()),
+                ("8", "命名模板", pattern),
             ];
             let mut table = Table::new(&["#", "设置项", "当前值"]).align(0, Align::Right);
             for (key, name, value) in rows {
@@ -1258,25 +1251,13 @@ impl App {
             };
             match choice.as_str() {
                 "1" => {
-                    if let Some(value) = prompt("新的临时文件夹（下载目录；回车取消）：")?
+                    if let Some(value) = prompt("新的下载文件夹（回车取消）：")?
                         && !value.trim().is_empty()
                     {
-                        self.update_settings(|s| s.temp_dir = value.trim().to_string());
+                        self.update_settings(|s| s.download_dir = value.trim().to_string());
                     }
                 }
                 "2" => {
-                    if let Some(value) =
-                        prompt("新的最终文件夹（同步目标；输入 - 清除；回车取消）：")?
-                    {
-                        let value = value.trim();
-                        if value == "-" {
-                            self.update_settings(|s| s.final_dir.clear());
-                        } else if !value.is_empty() {
-                            self.update_settings(|s| s.final_dir = value.to_string());
-                        }
-                    }
-                }
-                "3" => {
                     if let Some(value) = prompt("每文件连接数 1-32（回车取消）：")? {
                         let value = value.trim();
                         if value.is_empty() {
@@ -1288,7 +1269,7 @@ impl App {
                         }
                     }
                 }
-                "4" => {
+                "3" => {
                     if let Some(value) = prompt("每服务器并发数 1-8（回车取消）：")? {
                         let value = value.trim();
                         if value.is_empty() {
@@ -1300,7 +1281,7 @@ impl App {
                         }
                     }
                 }
-                "5" => {
+                "4" => {
                     if let Some(value) =
                         prompt("新的限速（如 5M / 800K；输入 - 清除限速；回车取消）：")?
                     {
@@ -1316,12 +1297,11 @@ impl App {
                         }
                     }
                 }
-                "6" => self.update_settings(|s| s.subs = !s.subs),
-                "7" => self.update_settings(|s| s.overwrite = !s.overwrite),
-                "8" => self.update_settings(|s| s.resume = !s.resume),
-                "9" => {
-                    if let Some(value) =
-                        prompt("新的命名模板（输入 - 恢复内置默认；回车取消）：")?
+                "5" => self.update_settings(|s| s.subs = !s.subs),
+                "6" => self.update_settings(|s| s.overwrite = !s.overwrite),
+                "7" => self.update_settings(|s| s.resume = !s.resume),
+                "8" => {
+                    if let Some(value) = prompt("新的命名模板（输入 - 恢复内置默认；回车取消）：")?
                     {
                         let value = value.trim();
                         if value == "-" {
@@ -1379,7 +1359,7 @@ impl App {
             .await
             .context("扫描未完成任务失败")?;
         if result.tasks.is_empty() {
-            println!("  {}", dim("临时文件夹里没有未完成任务"));
+            println!("  {}", dim("下载文件夹里没有未完成任务"));
             return Ok(());
         }
         if result.total > result.tasks.len() {
@@ -1469,49 +1449,32 @@ impl App {
 
     async fn history_menu(&self) -> Result<()> {
         print_section("下载记录");
-        let Some(value) = prompt("显示条数（回车=50，0=全部）：")? else {
+        let Some(value) = prompt("显示条数（回车=50，0=全部，c=清空全部记录）：")?
+        else {
             return Ok(());
         };
+        if value.eq_ignore_ascii_case("c") {
+            if confirm(
+                "清空全部下载记录、累计统计并删除历史文件？（正在下载的任务完成后仍会新增记录）",
+                false,
+            )? {
+                match self.daemon.clear_finished().await {
+                    Ok(()) => println!("{} 已清空下载记录与累计统计", green("✓")),
+                    Err(e) => println!(
+                        "{} {}",
+                        red("✗"),
+                        crate::emby::redact_text(&format!("{e:#}"))
+                    ),
+                }
+            }
+            return Ok(());
+        }
         let limit = if value.is_empty() {
             50
         } else {
             value.parse::<usize>().unwrap_or(50)
         };
         crate::print_history(limit)
-    }
-
-    fn sync_menu(&self) -> Result<()> {
-        print_section("同步到最终文件夹");
-        let temp = self.cfg.settings.temp_dir.trim();
-        let final_dir = self.cfg.settings.final_dir.trim();
-        print_key_value(
-            "临时文件夹",
-            if temp.is_empty() { "./downloads" } else { temp },
-        );
-        print_key_value(
-            "最终文件夹",
-            if final_dir.is_empty() {
-                "（未设置）"
-            } else {
-                final_dir
-            },
-        );
-        if final_dir.is_empty() {
-            println!(
-                "{} 请先在「下载设置」中设置最终文件夹，或使用 embydown sync --final <DIR>",
-                yellow("!")
-            );
-            return Ok(());
-        }
-
-        // 先展示预览，确认后再实际复制。
-        crate::review::sync(None, None, true, false)?;
-        if !confirm("开始同步？", true)? {
-            println!("{} 已取消", yellow("!"));
-            return Ok(());
-        }
-        let force = confirm("大小相同的文件也重新复制？", false)?;
-        crate::review::sync(None, None, false, force)
     }
 
     fn choose_server(&self, hint: &str) -> Result<Option<String>> {
@@ -1576,6 +1539,35 @@ fn retry_refs(state: &Snapshot) -> Vec<RetryRef> {
         }
     }
     refs
+}
+
+/// 空队列（无任务、无统计、未暂停）不显示在下载队列表格里。
+fn server_view_visible(server: &ServerView) -> bool {
+    server.paused
+        || !server.active.is_empty()
+        || !server.queue.is_empty()
+        || !server.retryable.is_empty()
+        || server.done > 0
+        || server.failed > 0
+        || server.cancelled > 0
+        || server.skipped > 0
+        || server.subs > 0
+        || server.bytes > 0
+}
+
+/// 服务器行的整体状态：空闲 / 运行中 / 等待中 / 待重试 / 已暂停。
+fn server_view_status(server: &ServerView) -> &'static str {
+    if server.paused {
+        "已暂停"
+    } else if !server.active.is_empty() {
+        "运行中"
+    } else if !server.queue.is_empty() {
+        "等待中"
+    } else if !server.retryable.is_empty() {
+        "待重试"
+    } else {
+        "空闲"
+    }
 }
 
 /// 排队任务的一行：同一服务器的同一季剧集聚合成一行。
@@ -2197,7 +2189,7 @@ fn build_opts(settings: &Settings) -> Result<DownloadOpts> {
 }
 
 fn output_path(settings: &Settings) -> Result<PathBuf> {
-    let out = settings.temp_dir.trim();
+    let out = settings.download_dir.trim();
     let out = if out.is_empty() { "./downloads" } else { out };
     crate::util::expand_tilde(Path::new(out))
 }
@@ -2296,13 +2288,9 @@ fn confirm(hint: &str, default_yes: bool) -> Result<bool> {
 fn read_secret(hint: &str) -> Result<Option<String>> {
     print!("{}", dim(hint));
     io::stdout().flush().context("刷新输出失败")?;
-    let mut guard = EchoGuard::default();
-    if io::stdin().is_terminal() {
-        guard.0 = std::process::Command::new("stty")
-            .arg("-echo")
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+    let guard = EchoGuard::new();
+    if io::stdin().is_terminal() && !guard.is_active() {
+        eprintln!("\n! 无法关闭终端回显，输入的密码可能会显示在屏幕上");
     }
     let mut line = String::new();
     let read = io::stdin().read_line(&mut line);
@@ -2318,14 +2306,68 @@ fn read_secret(hint: &str) -> Result<Option<String>> {
     Ok(Some(value))
 }
 
-#[derive(Default)]
-struct EchoGuard(bool);
+/// 输入密码时关闭终端回显。
+///
+/// 直接使用 termios，不依赖外部 `stty`（最小化系统上可能没有该命令）。
+/// 注意：进程被 SIGINT/SIGKILL 直接终止时 Drop 不会执行，终端可能保持
+/// 无回显状态；交互模式默认把 Ctrl+C 用于退出，这是已知取舍。
+#[cfg(unix)]
+struct EchoGuard {
+    fd: std::os::raw::c_int,
+    original: Option<libc::termios>,
+}
 
+#[cfg(unix)]
+impl EchoGuard {
+    fn new() -> Self {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY：term 由 tcgetattr 成功填充后才读取；只操作标准输入。
+        unsafe {
+            if libc::isatty(fd) == 1 {
+                let mut term: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut term) == 0 {
+                    let original = term;
+                    term.c_lflag &= !libc::ECHO;
+                    if libc::tcsetattr(fd, libc::TCSANOW, &term) == 0 {
+                        return Self {
+                            fd,
+                            original: Some(original),
+                        };
+                    }
+                }
+            }
+        }
+        Self { fd, original: None }
+    }
+
+    fn is_active(&self) -> bool {
+        self.original.is_some()
+    }
+}
+
+#[cfg(unix)]
 impl Drop for EchoGuard {
     fn drop(&mut self) {
-        if self.0 {
-            let _ = std::process::Command::new("stty").arg("echo").status();
+        if let Some(original) = &self.original {
+            // SAFETY：original 来自成功的 tcgetattr，fd 仍是标准输入。
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, original);
+            }
         }
+    }
+}
+
+#[cfg(not(unix))]
+struct EchoGuard;
+
+#[cfg(not(unix))]
+impl EchoGuard {
+    fn new() -> Self {
+        Self
+    }
+
+    fn is_active(&self) -> bool {
+        false
     }
 }
 
@@ -2581,5 +2623,62 @@ mod tests {
         );
         let rows = queue_rows(&single, &task_refs(&single));
         assert_eq!(rows[0].label(), "某剧 S01E02 · 第 2 集");
+    }
+
+    #[test]
+    fn empty_servers_are_hidden_and_status_is_accurate() {
+        let empty = ServerView::default();
+        assert!(!server_view_visible(&empty));
+        assert_eq!(server_view_status(&empty), "空闲");
+
+        let active = ServerView {
+            active: vec![crate::manager::ActiveView {
+                id: 1,
+                title: "下载中".into(),
+                position: 1,
+                length: 2,
+                elapsed_secs: 0.0,
+            }],
+            ..Default::default()
+        };
+        assert!(server_view_visible(&active));
+        assert_eq!(server_view_status(&active), "运行中");
+
+        let queued = ServerView {
+            queue: vec![crate::manager::QueueView {
+                id: 2,
+                title: "排队中".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(server_view_visible(&queued));
+        assert_eq!(server_view_status(&queued), "等待中");
+
+        let retry = ServerView {
+            retryable: vec![crate::manager::QueueView {
+                id: 3,
+                title: "失败".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(server_view_visible(&retry));
+        assert_eq!(server_view_status(&retry), "待重试");
+
+        let paused = ServerView {
+            paused: true,
+            ..Default::default()
+        };
+        assert!(server_view_visible(&paused));
+        assert_eq!(server_view_status(&paused), "已暂停");
+
+        // 有历史统计的服务器仍然显示，即使当前没有任务。
+        let counted = ServerView {
+            done: 1,
+            ..Default::default()
+        };
+        assert!(server_view_visible(&counted));
+        assert_eq!(server_view_status(&counted), "空闲");
     }
 }

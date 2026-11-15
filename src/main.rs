@@ -16,11 +16,11 @@ mod table;
 mod update;
 mod util;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use futures_util::future::join_all;
 use futures_util::StreamExt;
-use std::collections::HashSet;
+use futures_util::future::join_all;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 
 use crate::cli::{Cli, Cmd, LoginArgs};
@@ -48,7 +48,15 @@ async fn run(cli: Cli) -> Result<()> {
     match cmd {
         Cmd::Ui => interactive::run().await,
         Cmd::Daemon => daemon::run().await,
-        Cmd::History { limit } => print_history(limit),
+        Cmd::History { limit, clear } => {
+            if clear {
+                daemon::cli_clear_history().await?;
+                println!("已清空下载记录、累计统计与历史文件");
+                Ok(())
+            } else {
+                print_history(limit)
+            }
+        }
         Cmd::Pause { server } => {
             daemon::cli_pause(server.as_deref()).await?;
             match &server {
@@ -73,17 +81,7 @@ async fn run(cli: Cli) -> Result<()> {
             version,
             force,
         } => update::run(check, version, force).await,
-        Cmd::Review {
-            temp,
-            final_dir,
-            full,
-        } => review::run(temp, final_dir, full),
-        Cmd::Sync {
-            dry_run,
-            force,
-            temp,
-            final_dir,
-        } => review::sync(temp, final_dir, dry_run, force),
+        Cmd::Review { dir } => review::run(dir),
         cmd => run_command(cmd).await,
     }
 }
@@ -370,7 +368,11 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             let (name, profile) = pick_one(&cfg, server.server.as_deref())?;
             let client = client_for(name, profile).await?;
             let item = client.item(&id).await?;
-            println!("条目: {} ({}，服务器 {name})", item.title(), item.display_type());
+            println!(
+                "条目: {} ({}，服务器 {name})",
+                item.title(),
+                item.display_type()
+            );
             for (i, u) in client.media_urls(&item).iter().enumerate() {
                 println!("{}[{}] {}", if i == 0 { "" } else { "备用" }, i, u);
             }
@@ -409,7 +411,7 @@ async fn run_command(cmd: Cmd) -> Result<()> {
             let out = match out {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => {
-                    let configured = settings.temp_dir.trim();
+                    let configured = settings.download_dir.trim();
                     if configured.is_empty() {
                         std::path::PathBuf::from("./downloads")
                     } else {
@@ -518,12 +520,11 @@ async fn run_command(cmd: Cmd) -> Result<()> {
         | Cmd::Daemon
         | Cmd::Update { .. }
         | Cmd::Review { .. }
-        | Cmd::Sync { .. }
         | Cmd::History { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. } => {
             unreachable!(
-                "login/logout/servers/ui/daemon/update/review/sync/history/pause/resume 已在 run() 中处理"
+                "login/logout/servers/ui/daemon/update/review/history/pause/resume 已在 run() 中处理"
             )
         }
     }
@@ -555,8 +556,7 @@ async fn preview_matches(
 
     // 1) 明确写了 `名称:ID`
     if server.is_none()
-        && let Some((prefix, id)) = target.split_once(':')
-        && let Some(profile) = cfg.get(prefix)
+        && let Some((prefix, profile, id)) = split_server_target(cfg, target)
     {
         let client = client_for(prefix, profile).await?;
         let item = client
@@ -694,12 +694,8 @@ fn file_info_source(
                 .or_else(|| v.height.filter(|h| *h > 0).map(|h| format!("{h}p")))
         })
         .unwrap_or_default();
-    let vcodec = video
-        .and_then(|v| v.codec.clone())
-        .unwrap_or_default();
-    let acodec = audio
-        .and_then(|a| a.codec.clone())
-        .unwrap_or_default();
+    let vcodec = video.and_then(|v| v.codec.clone()).unwrap_or_default();
+    let acodec = audio.and_then(|a| a.codec.clone()).unwrap_or_default();
     (size, res, vcodec, acodec, container)
 }
 
@@ -730,9 +726,7 @@ async fn search_rows(server: &str, client: &Client, item: Item) -> Vec<SearchRow
                             multi_seasons.insert(season);
                         }
                         if f.episode_no() > 0 {
-                            *episode_counts
-                                .entry((season, f.episode_no()))
-                                .or_insert(0) += 1;
+                            *episode_counts.entry((season, f.episode_no())).or_insert(0) += 1;
                         }
                     }
                     for ((season, _), n) in &episode_counts {
@@ -876,11 +870,7 @@ async fn search_rows(server: &str, client: &Client, item: Item) -> Vec<SearchRow
     }
 
     let suffix = if item.item_type.as_deref() == Some("Episode") {
-        format!(
-            " [S{:02}E{:02}]",
-            item.season_no(),
-            item.episode_no()
-        )
+        format!(" [S{:02}E{:02}]", item.season_no(), item.episode_no())
     } else {
         String::new()
     };
@@ -1043,6 +1033,23 @@ fn join_set(set: std::collections::BTreeSet<String>) -> String {
     }
 }
 
+/// 解析 `服务器别名:ID`。
+///
+/// 别名本身可能包含冒号（例如默认别名 `host:8096`），不能简单用
+/// `split_once(':')`。这里按已知别名做最长前缀匹配。
+fn split_server_target<'a>(
+    cfg: &'a Config,
+    target: &'a str,
+) -> Option<(&'a str, &'a Profile, &'a str)> {
+    cfg.servers
+        .iter()
+        .filter_map(|(name, profile)| {
+            let rest = target.strip_prefix(name.as_str())?.strip_prefix(':')?;
+            (!rest.is_empty()).then_some((name.as_str(), profile, rest))
+        })
+        .max_by_key(|(name, _, _)| name.len())
+}
+
 /// 为下载定位条目：--server > `名称:ID` > 在所有服务器上自动查找。
 async fn pick_item(
     cfg: &Config,
@@ -1063,7 +1070,10 @@ async fn pick_item(
         match client.item(target).await {
             Ok(item) => return Ok((name.to_string(), client, item)),
             Err(e) => {
-                util::vlog(1, format!("  ↳ {name} 上未找到 ID {target}，尝试按名称搜索…"));
+                util::vlog(
+                    1,
+                    format!("  ↳ {name} 上未找到 ID {target}，尝试按名称搜索…"),
+                );
                 util::vlog(
                     2,
                     format!("    {}", crate::emby::redact_text(&format!("{e:#}"))),
@@ -1077,9 +1087,7 @@ async fn pick_item(
         return choose_item(found, target, cfg.servers.len());
     }
 
-    if let Some((prefix, id)) = target.split_once(':')
-        && let Some(profile) = cfg.get(prefix)
-    {
+    if let Some((prefix, profile, id)) = split_server_target(cfg, target) {
         let client = client_for(prefix, profile).await?;
         let item = client
             .item(id)
@@ -1118,12 +1126,12 @@ async fn pick_item(
         match res {
             Ok(item) => found.push((name, client, item)),
             Err(e) => util::vlog(
-                    2,
-                    format!(
-                        "  ↳ {name} 未找到 ID {target}: {}",
-                        crate::emby::redact_text(&format!("{e:#}"))
-                    ),
+                2,
+                format!(
+                    "  ↳ {name} 未找到 ID {target}: {}",
+                    crate::emby::redact_text(&format!("{e:#}"))
                 ),
+            ),
         }
     }
     if !found.is_empty() {
@@ -1131,7 +1139,10 @@ async fn pick_item(
     }
 
     // ID 找不到时，把参数当片名在所有服务器上搜索
-    util::vlog(1, format!("  ↳ 按 ID 未找到，尝试在所有服务器搜索 “{target}”…"));
+    util::vlog(
+        1,
+        format!("  ↳ 按 ID 未找到，尝试在所有服务器搜索 “{target}”…"),
+    );
     let found = search_clients(clients, target, limit).await;
     if found.is_empty() {
         bail!("所有服务器上都没找到 “{target}”；可用 embydown dl {target} --dry-run 查看匹配结果");
@@ -1164,9 +1175,9 @@ async fn search_clients(
                 }
             }
             Err(e) => eprintln!(
-                    "! {name} 搜索失败: {}",
-                    crate::emby::redact_text(&format!("{e:#}"))
-                ),
+                "! {name} 搜索失败: {}",
+                crate::emby::redact_text(&format!("{e:#}"))
+            ),
         }
     }
     // 合并多服务器结果后按相关度排序，ID 找不到时的自动选择也依赖这个顺序。
@@ -1233,11 +1244,7 @@ fn choose_item(
                     source
                 );
             }
-            let idx = prompt_choice(
-                found.len(),
-                "服务器",
-                "非交互环境请用 --server <名称> 指定",
-            )?;
+            let idx = prompt_choice(found.len(), "服务器", "非交互环境请用 --server <名称> 指定")?;
             let (name, client, item) = found.remove(idx);
             println!("📡 已选择服务器 {name}");
             Ok((name, client, item))
@@ -1467,8 +1474,7 @@ struct VersionSummary {
 
 /// 汇总每个版本覆盖的集数/条目数与总体积，用于交互选择。
 fn version_summaries(items: &[Item]) -> Vec<VersionSummary> {
-    let mut accs: std::collections::HashMap<String, VersionAcc> =
-        std::collections::HashMap::new();
+    let mut accs: std::collections::HashMap<String, VersionAcc> = std::collections::HashMap::new();
     for item in items {
         let sources = item.media_sources.as_deref().unwrap_or(&[]);
         for (i, src) in sources.iter().enumerate() {
@@ -1654,6 +1660,16 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
                 } else {
                     node.series_name.clone()
                 };
+                let inherited_series_id = match node.item_type.as_deref() {
+                    Some("Series") => Some(node.id.clone()),
+                    Some("Season") => node.series_id.clone().or_else(|| node.parent_id.clone()),
+                    _ => node.series_id.clone(),
+                };
+                // 单集自身的 ProviderIds.Tmdb 是单集 ID；目录命名需要剧集 ID。
+                let inherited_series_tmdb = match node.item_type.as_deref() {
+                    Some("Series") => node.tmdb_id().map(str::to_string),
+                    _ => node.series_tmdb_id.clone(),
+                };
                 let inherited_season = if node.item_type.as_deref() == Some("Season") {
                     node.index_number
                 } else {
@@ -1675,6 +1691,12 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
                         .unwrap_or(false);
                     if !has_series {
                         c.series_name = inherited_series.clone();
+                    }
+                    if c.series_id.is_none() {
+                        c.series_id = inherited_series_id.clone();
+                    }
+                    if c.series_tmdb_id.is_none() {
+                        c.series_tmdb_id = inherited_series_tmdb.clone();
                     }
                     if c.parent_index_number.is_none() {
                         c.parent_index_number = inherited_season;
@@ -1718,12 +1740,51 @@ async fn resolve_item(client: &Client, root: Item, seasons: &[i32]) -> Result<Ve
         }
         is_playable(c)
     });
+    // 直接下载单集/单季时，列表接口不会沿 Series 继承 ProviderIds；
+    // 补一次剧集详情查询，供默认命名写入 `[tmdbid-…]`。
+    enrich_series_tmdb(client, &mut out).await;
     Ok(out)
+}
+
+/// 给剧集条目补上所属剧集的 TMDB ID。
+///
+/// 单集自身的 `ProviderIds.Tmdb` 是单集 ID，不能用于剧集目录命名。
+/// 从 Series 展开时通常已在 [`resolve_item`] 中继承；这里兜底处理直接
+/// 下载单集/单季、或服务器列表接口不返回 Series ProviderIds 的情况。
+/// 查询失败时静默跳过，不影响下载。
+pub(crate) async fn enrich_series_tmdb(client: &Client, items: &mut [Item]) {
+    let missing: BTreeSet<String> = items
+        .iter()
+        .filter(|item| item.item_type.as_deref() == Some("Episode"))
+        .filter(|item| item.series_tmdb_id.is_none())
+        .filter_map(|item| item.series_id.clone())
+        .collect();
+    for series_id in missing {
+        let Ok(series) = client.item(&series_id).await else {
+            continue;
+        };
+        let Some(tmdb) = series.provider_id("Tmdb") else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            if item.item_type.as_deref() == Some("Episode")
+                && item.series_tmdb_id.is_none()
+                && item.series_id.as_deref() == Some(series_id.as_str())
+            {
+                item.series_tmdb_id = Some(tmdb.to_string());
+            }
+        }
+    }
 }
 
 /// 是否有可下载的媒体源。
 fn is_playable(item: &Item) -> bool {
-    item.is_video() || item.media_sources.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+    item.is_video()
+        || item
+            .media_sources
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
 }
 
 /// 纯直链 → 伪造一个 Item，让下载器复用同一套分块逻辑。
@@ -1752,9 +1813,7 @@ fn direct_item(url: &str) -> Item {
         })
         .filter(|v| is_plain_ext(v));
     let (stem, ext) = match last.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() && is_plain_ext(e) => {
-            (s.to_string(), e.to_ascii_lowercase())
-        }
+        Some((s, e)) if !s.is_empty() && is_plain_ext(e) => (s.to_string(), e.to_ascii_lowercase()),
         _ => (last.clone(), String::new()),
     };
     let generic = matches!(
@@ -1872,11 +1931,7 @@ fn season_label(season: Option<i32>) -> String {
 }
 
 fn dash(s: &str) -> &str {
-    if s.is_empty() {
-        "-"
-    } else {
-        s
-    }
+    if s.is_empty() { "-" } else { s }
 }
 
 fn table_row(it: &Item) -> String {
@@ -1915,7 +1970,11 @@ fn print_detail(item: &Item) {
         println!("所属剧集  : {s}");
     }
     if item.item_type.as_deref() == Some("Episode") {
-        println!("季/集     : S{:02}E{:02}", item.season_no(), item.episode_no());
+        println!(
+            "季/集     : S{:02}E{:02}",
+            item.season_no(),
+            item.episode_no()
+        );
     }
     if let Some(y) = item.production_year {
         println!("年份      : {y}");
@@ -1967,6 +2026,38 @@ fn print_detail(item: &Item) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_target_handles_aliases_with_ports() {
+        let profile = |server: &str| Profile {
+            server: server.into(),
+            token: "t".into(),
+            user_id: "u".into(),
+            username: None,
+            insecure: false,
+        };
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            "media.example.com".into(),
+            profile("https://media.example.com"),
+        );
+        cfg.servers.insert(
+            "media.example.com:8096".into(),
+            profile("https://media.example.com:8096"),
+        );
+
+        let (name, _, id) = split_server_target(&cfg, "media.example.com:8096:abc").unwrap();
+        assert_eq!(name, "media.example.com:8096");
+        assert_eq!(id, "abc");
+
+        let (name, _, id) = split_server_target(&cfg, "media.example.com:abc").unwrap();
+        assert_eq!(name, "media.example.com");
+        assert_eq!(id, "abc");
+
+        assert!(split_server_target(&cfg, "other:abc").is_none());
+        // 空 ID 不作为有效目标。
+        assert!(split_server_target(&cfg, "media.example.com:").is_none());
+    }
 
     #[test]
     fn display_padding_counts_cjk_as_two_columns() {
@@ -2021,9 +2112,7 @@ mod tests {
         let (kept, skipped) = filter_to_version(items, "Nekomoe");
         assert_eq!(skipped, 0);
         assert_eq!(kept.len(), 3);
-        assert!(kept
-            .iter()
-            .all(|i| i.version.as_deref() == Some("Nekomoe")));
+        assert!(kept.iter().all(|i| i.version.as_deref() == Some("Nekomoe")));
         assert_eq!(kept[2].media_sources.as_ref().unwrap().len(), 1);
     }
 
@@ -2050,7 +2139,10 @@ mod tests {
             ep("c", 1, 2, &["Nekomoe"]),
         ];
         let (kept, _) = filter_to_version(items, "Nekomoe");
-        assert!(kept[0].source_locked, "多源条目锁定后不能用版本无关的回退接口");
+        assert!(
+            kept[0].source_locked,
+            "多源条目锁定后不能用版本无关的回退接口"
+        );
         assert!(!kept[1].source_locked, "单源条目的回退接口仍然安全");
     }
 

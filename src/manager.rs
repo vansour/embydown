@@ -7,14 +7,14 @@
 //! 通过 Unix socket 控制本模块，因此 交互模式崩溃/关闭不会中断下载；守护进程
 //! 重启时也会从 `queue.json` 恢复未完成的任务。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use indicatif::ProgressBar;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::download::{self, DownloadOpts, Limiter};
 use crate::emby::{Client, ClientCreds};
@@ -29,6 +29,8 @@ pub struct ManagerState {
     seq: u64,
     /// 每次派发递增，用于区分同一任务的旧/新下载实例。
     attempt_seq: u64,
+    /// 入队批次编号：同一次 enqueue 的任务共享并发/限速参数。
+    batch_seq: u64,
 }
 
 #[derive(Default)]
@@ -52,6 +54,8 @@ pub struct ServerState {
 
 pub struct PendingJob {
     pub id: u64,
+    /// 同一次 `enqueue` 的子任务共享该批次编号。
+    pub batch: u64,
     pub title: String,
     item: Item,
     opts: DownloadOpts,
@@ -59,6 +63,8 @@ pub struct PendingJob {
 
 pub struct ActiveJob {
     pub id: u64,
+    /// 所属入队批次；限速器与批次并发上限都按它查找。
+    pub batch: u64,
     /// 本次派发的唯一编号：暂停后重新派发同一任务时，旧实例的完成消息不会误伤新实例。
     pub attempt: u64,
     pub title: String,
@@ -137,6 +143,77 @@ pub struct ActiveView {
     pub elapsed_secs: f64,
 }
 
+/// 一次入队批次请求的文件级并发数（与 CLI 的 `--jobs` 一致）。
+fn batch_limit(opts: &DownloadOpts) -> usize {
+    opts.jobs.clamp(1, 8)
+}
+
+/// 该批次当前是否还能再派发一个任务。
+fn batch_has_capacity(
+    batch: u64,
+    opts: &DownloadOpts,
+    active_per_batch: &HashMap<u64, usize>,
+) -> bool {
+    active_per_batch.get(&batch).copied().unwrap_or(0) < batch_limit(opts)
+}
+
+/// 找到下一个可派发的任务。
+///
+/// 跳过已经达到自身并发上限的批次，让其它批次使用空闲槽位；
+/// 同一批次内部仍保持先进先出。
+fn next_dispatch_index(
+    queue: &VecDeque<PendingJob>,
+    active_per_batch: &HashMap<u64, usize>,
+) -> Option<usize> {
+    queue
+        .iter()
+        .position(|job| batch_has_capacity(job.batch, &job.opts, active_per_batch))
+}
+
+/// 服务器是否还有需要在下载队列里展示/持久化的状态。
+///
+/// 没有任务、没有历史统计、也没有暂停的空队列不应长期留在
+/// `queue.json` 或界面的服务器列表里。
+fn server_has_display_state(ss: &ServerState) -> bool {
+    ss.paused
+        || !ss.queue.is_empty()
+        || !ss.active.is_empty()
+        || !ss.retryable.is_empty()
+        || ss.done > 0
+        || ss.failed > 0
+        || ss.cancelled > 0
+        || ss.skipped > 0
+        || ss.subs > 0
+        || ss.bytes > 0
+}
+
+/// 清空下载记录与累计统计，但保留排队/运行中的任务。
+fn clear_finished_state(st: &mut ManagerState) {
+    st.finished.clear();
+    for ss in st.servers.values_mut() {
+        ss.retryable.clear();
+        ss.done = 0;
+        ss.failed = 0;
+        ss.cancelled = 0;
+        ss.skipped = 0;
+        ss.subs = 0;
+        ss.bytes = 0;
+    }
+}
+
+/// 服务器总并发取当前队列/运行中所有批次的最大值：
+/// 新批次可以调高上限，但不会把旧批次的并发悄悄降下来。
+fn recompute_max_jobs(ss: &mut ServerState) {
+    ss.max_jobs = ss
+        .queue
+        .iter()
+        .map(|job| batch_limit(&job.opts))
+        .chain(ss.active.iter().map(|job| batch_limit(&job.opts)))
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 8);
+}
+
 #[derive(Clone)]
 pub struct Manager {
     tx: mpsc::UnboundedSender<Cmd>,
@@ -159,7 +236,9 @@ enum Cmd {
     ResumeServer(String),
     PauseAll,
     ResumeAll,
-    ClearFinished,
+    ClearFinished {
+        reply: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    },
     Completed {
         server: String,
         attempt: u64,
@@ -177,7 +256,8 @@ struct EnqueueCmd {
 
 struct ServerCtx {
     client: Client,
-    limiter: Arc<Limiter>,
+    /// 每个入队批次一份限速器：后来的入队不会改变已排队任务的限速。
+    limiters: HashMap<u64, Arc<Limiter>>,
 }
 
 impl Manager {
@@ -188,6 +268,16 @@ impl Manager {
         let reply = tx.clone();
         tokio::spawn(async move { run(rx, reply, shared).await });
         Self { tx, state }
+    }
+
+    /// 仅测试用：不启动事件循环、不读写用户配置/队列。
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Self {
+            tx,
+            state: Arc::new(Mutex::new(ManagerState::default())),
+        }
     }
 
     /// 把一批条目加入某个服务器的下载队列。
@@ -240,8 +330,16 @@ impl Manager {
         let _ = self.tx.send(Cmd::ResumeAll);
     }
 
-    pub fn clear_finished(&self) {
-        let _ = self.tx.send(Cmd::ClearFinished);
+    /// 清空最近完成记录、累计统计与历史文件。
+    ///
+    /// 等待后台队列处理完成后再返回，确保界面/CLI 的成功提示不会早于
+    /// `history.jsonl` 与 `queue.json` 的实际更新。
+    pub async fn clear_finished(&self) -> std::result::Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ClearFinished { reply: Some(reply) })
+            .map_err(|_| "后台下载队列未运行".to_string())?;
+        rx.await.map_err(|_| "后台下载队列未响应".to_string())?
     }
 
     pub fn state(&self) -> std::sync::MutexGuard<'_, ManagerState> {
@@ -268,6 +366,7 @@ fn snapshot_of(st: &ManagerState) -> Snapshot {
         servers: st
             .servers
             .iter()
+            .filter(|(_, ss)| server_has_display_state(ss))
             .map(|(name, ss)| {
                 let view = ServerView {
                     queue: ss.queue.iter().map(queue_view).collect(),
@@ -337,25 +436,30 @@ fn persisted(st: &ManagerState) -> PersistedState {
         servers: st
             .servers
             .iter()
+            .filter(|(_, ss)| server_has_display_state(ss))
             .map(|(name, ss)| {
-                let record = |id: u64, title: &str, item: &Item, opts: &DownloadOpts| JobRecord {
-                    id,
-                    title: title.to_string(),
-                    item: item.clone(),
-                    opts: opts.clone(),
-                };
+                let record =
+                    |id: u64, batch: u64, title: &str, item: &Item, opts: &DownloadOpts| {
+                        JobRecord {
+                            id,
+                            batch,
+                            title: title.to_string(),
+                            item: item.clone(),
+                            opts: opts.clone(),
+                        }
+                    };
                 let server = PersistedServer {
                     creds: ss.creds.clone(),
                     max_jobs: ss.max_jobs,
                     queue: ss
                         .queue
                         .iter()
-                        .map(|q| record(q.id, &q.title, &q.item, &q.opts))
+                        .map(|q| record(q.id, q.batch, &q.title, &q.item, &q.opts))
                         .collect(),
                     active: ss
                         .active
                         .iter()
-                        .map(|a| record(a.id, &a.title, &a.item, &a.opts))
+                        .map(|a| record(a.id, a.batch, &a.title, &a.item, &a.opts))
                         .collect(),
                     done: ss.done,
                     failed: ss.failed,
@@ -376,7 +480,10 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
     let saved = store::load_state();
     let had_state = saved.is_some();
     let saved = saved.unwrap_or_default();
-    let config = crate::config::load_optional().ok().flatten().unwrap_or_default();
+    let config = crate::config::load_optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -395,6 +502,7 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
             for job in ps.active.into_iter().rev() {
                 pending.push_front(PendingJob {
                     id: job.id,
+                    batch: job.batch,
                     title: job.title,
                     item: job.item,
                     opts: job.opts,
@@ -403,38 +511,47 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
             for job in ps.queue {
                 pending.push_back(PendingJob {
                     id: job.id,
+                    batch: job.batch,
                     title: job.title,
                     item: job.item,
                     opts: job.opts,
                 });
             }
-            st.servers.insert(
-                name,
-                ServerState {
-                    queue: pending,
-                    retryable: VecDeque::new(),
-                    active: Vec::new(),
-                    max_jobs: ps.max_jobs.clamp(1, 8),
-                    done: ps.done,
-                    failed: ps.failed,
-                    cancelled: ps.cancelled,
-                    skipped: ps.skipped,
-                    subs: ps.subs,
-                    bytes: ps.bytes,
-                    paused: ps.paused,
-                    creds,
-                },
-            );
+            let mut restored = ServerState {
+                queue: pending,
+                retryable: VecDeque::new(),
+                active: Vec::new(),
+                max_jobs: ps.max_jobs.clamp(1, 8),
+                done: ps.done,
+                failed: ps.failed,
+                cancelled: ps.cancelled,
+                skipped: ps.skipped,
+                subs: ps.subs,
+                bytes: ps.bytes,
+                paused: ps.paused,
+                creds,
+            };
+            recompute_max_jobs(&mut restored);
+            st.servers.insert(name, restored);
         }
+
+        // 恢复后新入队的批次编号必须大于队列里已有的任何批次。
+        st.batch_seq = st
+            .servers
+            .values()
+            .flat_map(|ss| {
+                ss.queue
+                    .iter()
+                    .map(|job| job.batch)
+                    .chain(ss.active.iter().map(|job| job.batch))
+            })
+            .max()
+            .unwrap_or(0);
 
         // 历史只保留最近 50 条在内存里；完整记录仍在 history.jsonl。
         let history = store::load_history();
         let skip = history.len().saturating_sub(50);
-        st.finished = history
-            .into_iter()
-            .skip(skip)
-            .map(|h| h.entry)
-            .collect();
+        st.finished = history.into_iter().skip(skip).map(|h| h.entry).collect();
     }
 
     // 后台任务需要用保存的 token 重建客户端，否则重启后无法继续下载。
@@ -445,18 +562,18 @@ fn restore(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCt
             eprintln!("! 无法为 {name} 恢复下载连接，队列将等待下次入队时刷新");
             continue;
         };
-        let rate = ss
-            .queue
-            .front()
-            .map(|j| j.opts.limit_rate)
-            .unwrap_or_default();
-        ctx.insert(
-            name.clone(),
-            ServerCtx {
-                client,
-                limiter: Arc::new(Limiter::new(rate)),
-            },
-        );
+        let mut limiters = HashMap::new();
+        for job in &ss.queue {
+            limiters
+                .entry(job.batch)
+                .or_insert_with(|| Arc::new(Limiter::new(job.opts.limit_rate)));
+        }
+        for job in &ss.active {
+            limiters
+                .entry(job.batch)
+                .or_insert_with(|| Arc::new(Limiter::new(job.opts.limit_rate)));
+        }
+        ctx.insert(name.clone(), ServerCtx { client, limiters });
     }
     had_state
 }
@@ -472,6 +589,7 @@ fn requeue_active(ss: &mut ServerState) {
         .drain(..)
         .map(|a| PendingJob {
             id: a.id,
+            batch: a.batch,
             title: a.title,
             item: a.item,
             opts: a.opts,
@@ -539,38 +657,49 @@ async fn run(
                     items,
                     opts,
                 } = *cmd;
-                {
+                let batch = {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    let count = items.len() as u64;
                     let start_id = st.seq;
-                    st.seq += items.len() as u64;
+                    st.seq += count;
+                    let batch = if count == 0 {
+                        0
+                    } else {
+                        st.batch_seq += 1;
+                        st.batch_seq
+                    };
                     let entry = st.servers.entry(server.clone()).or_default();
-                    entry.max_jobs = opts.jobs.clamp(1, 8);
                     entry.creds = Some(client.creds());
                     for (offset, item) in items.into_iter().enumerate() {
                         let title = item.title();
                         entry.queue.push_back(PendingJob {
                             id: start_id + offset as u64 + 1,
+                            batch,
                             title,
                             item,
                             opts: opts.clone(),
                         });
                     }
-                }
+                    recompute_max_jobs(entry);
+                    batch
+                };
                 // 每次都刷新 Client：重新登录后 token / 地址 / 证书设置可能已变，
                 // 沿用旧 Client 会让新任务 401 或连到旧服务器。
+                // 限速器按批次保存，新批次不会改动其它批次的限速。
                 match ctx.get_mut(&server) {
                     Some(c) => {
                         c.client = client;
-                        c.limiter = Arc::new(Limiter::new(opts.limit_rate));
+                        if batch != 0 {
+                            c.limiters
+                                .insert(batch, Arc::new(Limiter::new(opts.limit_rate)));
+                        }
                     }
                     None => {
-                        ctx.insert(
-                            server.clone(),
-                            ServerCtx {
-                                client,
-                                limiter: Arc::new(Limiter::new(opts.limit_rate)),
-                            },
-                        );
+                        let mut limiters = HashMap::new();
+                        if batch != 0 {
+                            limiters.insert(batch, Arc::new(Limiter::new(opts.limit_rate)));
+                        }
+                        ctx.insert(server.clone(), ServerCtx { client, limiters });
                     }
                 }
                 dirty = true;
@@ -583,6 +712,7 @@ async fn run(
                     }
                     ss.paused = false;
                     ss.queue.clear();
+                    recompute_max_jobs(ss);
                 }
                 drop(st);
                 dirty = true;
@@ -595,6 +725,7 @@ async fn run(
                     }
                     ss.paused = false;
                     ss.queue.clear();
+                    recompute_max_jobs(ss);
                 }
                 drop(st);
                 dirty = true;
@@ -602,12 +733,18 @@ async fn run(
             Cmd::CancelJob { server, id } => {
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 cancel_job_in(&mut st, &server, id);
+                if let Some(ss) = st.servers.get_mut(&server) {
+                    recompute_max_jobs(ss);
+                }
                 drop(st);
                 dirty = true;
             }
             Cmd::RetryJob { server, id } => {
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 retry_job_in(&mut st, &server, id);
+                if let Some(ss) = st.servers.get_mut(&server) {
+                    recompute_max_jobs(ss);
+                }
                 drop(st);
                 dirty = true;
             }
@@ -622,6 +759,7 @@ async fn run(
                             job.cancel.store(true, Ordering::SeqCst);
                         }
                         requeue_active(ss);
+                        recompute_max_jobs(ss);
                     }
                 }
                 dirty = true;
@@ -644,6 +782,7 @@ async fn run(
                             job.cancel.store(true, Ordering::SeqCst);
                         }
                         requeue_active(ss);
+                        recompute_max_jobs(ss);
                     }
                 }
                 drop(st);
@@ -658,17 +797,20 @@ async fn run(
                 }
                 dirty = true;
             }
-            Cmd::ClearFinished => {
+            Cmd::ClearFinished { reply } => {
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.finished.clear();
-                    for ss in st.servers.values_mut() {
-                        ss.retryable.clear();
-                    }
+                    clear_finished_state(&mut st);
                 }
-                if let Err(e) = store::clear_history() {
-                    eprintln!("! 清空下载记录失败: {e:#}");
+                let result = store::clear_history().map_err(|e| format!("{e:#}"));
+                if let Err(e) = &result {
+                    eprintln!("! 清空下载记录失败: {e}");
                 }
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+                // 累计计数也归零，必须落盘，否则重启后又会显示旧统计。
+                dirty = true;
             }
             Cmd::Completed {
                 server,
@@ -705,6 +847,7 @@ async fn run(
                     if status == FinishedStatus::Failed {
                         let ActiveJob {
                             id,
+                            batch,
                             title,
                             item,
                             opts,
@@ -712,6 +855,7 @@ async fn run(
                         } = &job;
                         ss.retryable.push_back(PendingJob {
                             id: *id,
+                            batch: *batch,
                             title: title.clone(),
                             item: item.clone(),
                             opts: opts.clone(),
@@ -720,6 +864,7 @@ async fn run(
                             ss.retryable.pop_front();
                         }
                     }
+                    recompute_max_jobs(ss);
                     done = Some(Finished {
                         server: server.clone(),
                         title: job.title,
@@ -745,9 +890,10 @@ async fn run(
             }
             _ = tick.tick() => {}
         }
-        if dispatch(&state, &ctx, &tx) > 0 {
+        if dispatch(&state, &mut ctx, &tx) > 0 {
             dirty = true;
         }
+        prune_limiters(&state, &mut ctx);
         if dirty {
             let snapshot = {
                 let st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -771,10 +917,13 @@ async fn run(
 }
 
 /// 为每个服务器启动尽可能多的下载任务（不超过该服务器自己的并发数）。
+///
+/// 每个批次还有自己的文件级并发上限；队首批次达到上限时暂停派发，
+/// 以保持 FIFO 顺序，避免后面的批次插队。
 /// 返回本次派发的任务数。
 fn dispatch(
     state: &Arc<Mutex<ManagerState>>,
-    ctx: &BTreeMap<String, ServerCtx>,
+    ctx: &mut BTreeMap<String, ServerCtx>,
     tx: &mpsc::UnboundedSender<Cmd>,
 ) -> usize {
     let mut spawns = Vec::new();
@@ -782,7 +931,10 @@ fn dispatch(
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut attempt_seq = st.attempt_seq;
         for (server, ss) in st.servers.iter_mut() {
-            let Some(c) = ctx.get(server) else { continue };
+            let Some(c) = ctx.get_mut(server) else {
+                continue;
+            };
+            recompute_max_jobs(ss);
             // 用户暂停后不派发新任务；继续时由 update 循环重新触发。
             if ss.paused {
                 continue;
@@ -791,15 +943,29 @@ fn dispatch(
             if download::server_rate_limited(&c.client.server).is_some() {
                 continue;
             }
+            let mut active_per_batch: HashMap<u64, usize> = HashMap::new();
+            for job in &ss.active {
+                *active_per_batch.entry(job.batch).or_insert(0) += 1;
+            }
             while ss.active.len() < ss.max_jobs.max(1) {
-                let Some(job) = ss.queue.pop_front() else { break };
+                let Some(index) = next_dispatch_index(&ss.queue, &active_per_batch) else {
+                    break;
+                };
+                let job = ss.queue.remove(index).expect("索引来自队列");
+                let limiter = c
+                    .limiters
+                    .entry(job.batch)
+                    .or_insert_with(|| Arc::new(Limiter::new(job.opts.limit_rate)))
+                    .clone();
                 let pb = ProgressBar::hidden();
                 pb.set_message(job.title.clone());
                 let cancel = Arc::new(AtomicBool::new(false));
                 attempt_seq += 1;
                 let attempt = attempt_seq;
+                *active_per_batch.entry(job.batch).or_insert(0) += 1;
                 ss.active.push(ActiveJob {
                     id: job.id,
+                    batch: job.batch,
                     attempt,
                     title: job.title.clone(),
                     pb: pb.clone(),
@@ -813,7 +979,7 @@ fn dispatch(
                     job,
                     attempt,
                     c.client.clone(),
-                    Arc::clone(&c.limiter),
+                    limiter,
                     cancel,
                     pb,
                 ));
@@ -859,25 +1025,59 @@ fn dispatch(
     count
 }
 
+/// 清理已经没有排队/运行任务的批次限速器，避免长时间运行时无限增长。
+fn prune_limiters(state: &Arc<Mutex<ManagerState>>, ctx: &mut BTreeMap<String, ServerCtx>) {
+    let live: BTreeMap<String, HashSet<u64>> = {
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.servers
+            .iter()
+            .map(|(name, ss)| {
+                let batches = ss
+                    .queue
+                    .iter()
+                    .map(|job| job.batch)
+                    .chain(ss.active.iter().map(|job| job.batch))
+                    .collect();
+                (name.clone(), batches)
+            })
+            .collect()
+    };
+    for (name, c) in ctx.iter_mut() {
+        match live.get(name) {
+            Some(batches) => c.limiters.retain(|batch, _| batches.contains(batch)),
+            None => c.limiters.clear(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn pending(id: u64) -> PendingJob {
+        pending_batch(id, 1, 2)
+    }
+
+    fn pending_batch(id: u64, batch: u64, jobs: usize) -> PendingJob {
         PendingJob {
             id,
+            batch,
             title: format!("任务 {id}"),
             item: Item {
                 id: format!("item{id}"),
                 ..Default::default()
             },
-            opts: DownloadOpts::default(),
+            opts: DownloadOpts {
+                jobs,
+                ..Default::default()
+            },
         }
     }
 
     fn active(id: u64) -> ActiveJob {
         ActiveJob {
             id,
+            batch: 1,
             attempt: id,
             title: format!("任务 {id}"),
             pb: ProgressBar::hidden(),
@@ -909,6 +1109,48 @@ mod tests {
     }
 
     #[test]
+    fn later_batches_do_not_lower_server_concurrency() {
+        let mut ss = ServerState::default();
+        ss.queue.push_back(pending_batch(1, 1, 4));
+        ss.queue.push_back(pending_batch(2, 2, 2));
+        recompute_max_jobs(&mut ss);
+        assert_eq!(ss.max_jobs, 4);
+
+        // 队列清空后回落到默认值 1。
+        ss.queue.clear();
+        recompute_max_jobs(&mut ss);
+        assert_eq!(ss.max_jobs, 1);
+    }
+
+    #[test]
+    fn each_batch_has_its_own_concurrency_limit() {
+        let job = pending_batch(1, 7, 3);
+        let mut active = HashMap::new();
+        assert!(batch_has_capacity(job.batch, &job.opts, &active));
+        active.insert(7, 2);
+        assert!(batch_has_capacity(job.batch, &job.opts, &active));
+        active.insert(7, 3);
+        assert!(!batch_has_capacity(job.batch, &job.opts, &active));
+        // 其它批次不受影响。
+        assert!(batch_has_capacity(8, &job.opts, &active));
+    }
+
+    #[test]
+    fn dispatch_skips_batches_that_are_already_full() {
+        let mut queue = VecDeque::new();
+        queue.push_back(pending_batch(1, 1, 1));
+        queue.push_back(pending_batch(2, 2, 1));
+        let mut active = HashMap::new();
+
+        assert_eq!(next_dispatch_index(&queue, &active), Some(0));
+        active.insert(1, 1);
+        // 批次 1 已满，跳到批次 2 的任务。
+        assert_eq!(next_dispatch_index(&queue, &active), Some(1));
+        active.insert(2, 1);
+        assert_eq!(next_dispatch_index(&queue, &active), None);
+    }
+
+    #[test]
     fn cancel_and_retry_single_jobs() {
         let mut st = ManagerState::default();
         let mut ss = ServerState::default();
@@ -924,11 +1166,7 @@ mod tests {
         let ids: Vec<u64> = st.servers["media"].queue.iter().map(|j| j.id).collect();
         assert_eq!(ids, vec![2]);
         assert!(cancel_job_in(&mut st, "media", 3));
-        assert!(
-            st.servers["media"].active[0]
-                .cancel
-                .load(Ordering::SeqCst)
-        );
+        assert!(st.servers["media"].active[0].cancel.load(Ordering::SeqCst));
         assert!(!cancel_job_in(&mut st, "media", 99));
 
         // 重试分配新编号并移到队尾。
@@ -937,5 +1175,56 @@ mod tests {
         assert!(st.servers["media"].retryable.is_empty());
         assert_eq!(st.seq, 11);
         assert!(!retry_job_in(&mut st, "media", 4));
+    }
+
+    #[test]
+    fn clearing_records_resets_counters_but_keeps_queue() {
+        let mut st = ManagerState::default();
+        let mut ss = ServerState::default();
+        ss.queue.push_back(pending(1));
+        ss.active.push(active(2));
+        ss.retryable.push_back(pending(3));
+        ss.done = 5;
+        ss.failed = 2;
+        ss.cancelled = 1;
+        ss.skipped = 3;
+        ss.subs = 4;
+        ss.bytes = 99;
+        st.servers.insert("media".into(), ss);
+        st.finished.push(Finished {
+            server: "media".into(),
+            title: "旧记录".into(),
+            status: FinishedStatus::Done,
+            bytes: 10,
+            error: None,
+        });
+
+        clear_finished_state(&mut st);
+
+        let ss = &st.servers["media"];
+        assert!(st.finished.is_empty());
+        assert!(ss.retryable.is_empty());
+        assert_eq!((ss.done, ss.failed, ss.cancelled), (0, 0, 0));
+        assert_eq!((ss.skipped, ss.subs, ss.bytes), (0, 0, 0));
+        // 排队/运行中的任务不能被清掉。
+        assert_eq!(ss.queue.len(), 1);
+        assert_eq!(ss.active.len(), 1);
+    }
+
+    #[test]
+    fn empty_servers_are_omitted_from_snapshot_and_queue_file() {
+        let mut st = ManagerState::default();
+        st.servers.insert("empty".into(), ServerState::default());
+        let mut active = ServerState::default();
+        active.queue.push_back(pending(1));
+        st.servers.insert("active".into(), active);
+
+        let snapshot = snapshot_of(&st);
+        assert!(!snapshot.servers.contains_key("empty"));
+        assert!(snapshot.servers.contains_key("active"));
+
+        let persisted = persisted(&st);
+        assert!(!persisted.servers.contains_key("empty"));
+        assert!(persisted.servers.contains_key("active"));
     }
 }

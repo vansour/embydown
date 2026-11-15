@@ -8,7 +8,7 @@ use std::path::PathBuf;
     name = "embydown",
     version,
     about = "Emby 媒体下载工具（默认直链：static stream / Download）",
-    long_about = "Emby 媒体下载工具。\n\n直接运行 `embydown`（或 `embydown ui`）进入命令行交互模式：数字菜单选择搜索、浏览媒体库、管理服务器、下载队列与设置。\n也可以使用子命令：先运行 `embydown login --server <URL> --user <账号> --password <密码>` 保存登录信息；\n可重复 login（配合 --name）同时登录多个服务器，`embydown servers` 查看。\ndl 默认覆盖所有服务器；`dl <关键字> --dry-run` 会列出匹配文件的大小、分辨率、编码等信息。\n默认使用直链下载原始文件（/Videos/{id}/stream?static=true，失败回退 /Items/{id}/Download），\n支持分块并发、断点续传与整季批量下载。\n下载先落到临时文件夹；`embydown review` 在本地审查缺集/异常，`embydown sync` 复制到最终文件夹。\n安装一次后可运行 `embydown update` 自更新，无需 curl。"
+    long_about = "Emby 媒体下载工具。\n\n直接运行 `embydown`（或 `embydown ui`）进入命令行交互模式：数字菜单选择搜索、浏览媒体库、管理服务器、下载队列与设置。\n也可以使用子命令：先运行 `embydown login --server <URL> --user <账号> --password <密码>` 保存登录信息；\n可重复 login（配合 --name）同时登录多个服务器，`embydown servers` 查看。\ndl 默认覆盖所有服务器；`dl <关键字> --dry-run` 会列出匹配文件的大小、分辨率、编码等信息。\n默认使用直链下载原始文件（/Videos/{id}/stream?static=true，失败回退 /Items/{id}/Download），\n支持分块并发、断点续传与整季批量下载。\n下载直接保存到下载文件夹；`embydown review` 在本地审查缺集/异常文件。\n安装一次后可运行 `embydown update` 自更新，无需 curl。"
 )]
 pub struct Cli {
     /// 详细日志：-v 常规，-vv 调试
@@ -85,42 +85,18 @@ pub enum Cmd {
         /// 显示条数；0 表示全部
         #[arg(long, default_value_t = 50)]
         limit: usize,
+
+        /// 清空全部下载记录、累计统计并删除 history.jsonl（不中断正在下载的任务）
+        #[arg(long)]
+        clear: bool,
     },
 
-    /// 本地审查临时/最终文件夹：内容、缺集、重复集、未完成与损坏文件、同步差异
+    /// 本地审查下载文件夹：内容、缺集、重复集、未完成与异常文件
     #[command(alias = "check", alias = "inspect")]
     Review {
-        /// 临时文件夹（默认使用配置中的下载目录）
-        #[arg(long, value_name = "DIR")]
-        temp: Option<PathBuf>,
-
-        /// 最终文件夹（默认使用配置中的最终文件夹）
-        #[arg(long = "final", value_name = "DIR")]
-        final_dir: Option<PathBuf>,
-
-        /// 额外读取最终端临时文件所在目录的直属文件（只读结构、不读大小；不遍历整棵媒体树）
-        #[arg(long)]
-        full: bool,
-    },
-
-    /// 将临时文件夹的内容同步（复制）到最终文件夹
-    #[command(alias = "copy")]
-    Sync {
-        /// 只显示将要复制的内容，不实际写入
-        #[arg(long)]
-        dry_run: bool,
-
-        /// 即使大小相同也重新复制
-        #[arg(long)]
-        force: bool,
-
-        /// 临时文件夹（默认使用配置中的下载目录）
-        #[arg(long, value_name = "DIR")]
-        temp: Option<PathBuf>,
-
-        /// 最终文件夹（默认使用配置中的最终文件夹）
-        #[arg(long = "final", value_name = "DIR")]
-        final_dir: Option<PathBuf>,
+        /// 下载文件夹（默认使用配置中的下载文件夹）
+        #[arg(long = "dir", alias = "temp", value_name = "DIR")]
+        dir: Option<PathBuf>,
     },
 
     /// 暂停后台下载队列（先停止派发，正在下载的任务放回队首，保留断点）
@@ -201,11 +177,12 @@ pub enum Cmd {
         /// 条目 ID（可写 `名称:ID`）、片名关键字，或 http(s) 直链
         target: String,
 
-        /// 临时文件夹（下载目录；省略时使用配置文件中的值，默认 ./downloads）
+        /// 下载文件夹（省略时使用配置文件中的值，默认 ./downloads）
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
 
-        /// 命名模板，如 "{series} ({seriesyear})/Season {season5}/{series} - S{season5}E{episode5}.{ext}"
+        /// 命名模板，如 "{series} ({seriesyear}){tmdbidtag}/Season {season00}/{series} - S{season00}E{episode00}.{ext}"；
+        /// {tmdbid} 为原始 TMDB ID，{tmdbidtag} 为可选的 " [tmdbid-123]"（取不到时为空）
         #[arg(long)]
         pattern: Option<String>,
 

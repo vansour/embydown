@@ -1,6 +1,6 @@
 //! 多服务器登录配置：保存在 `$XDG_CONFIG_HOME/embydown/config.json`（Linux）。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -27,12 +27,11 @@ pub struct Profile {
 #[serde(default)]
 pub struct Settings {
     /// 交互模式「下载设置」的默认值；修改后自动保存。
-    /// 临时文件夹：下载先落到这里。
-    /// 旧配置里的 `out` 键会自动迁移到这个字段。
-    #[serde(alias = "out")]
-    pub temp_dir: String,
-    /// 最终文件夹：审查通过后用 `embydown sync` 复制到这里。
-    pub final_dir: String,
+    /// 下载文件夹：下载直接保存到这里。
+    /// 旧配置里的 `temp_dir` / `out` 键会自动迁移到这个字段；
+    /// 旧版的 `final_dir` 键不再使用（反序列化时忽略）。
+    #[serde(alias = "temp_dir", alias = "out")]
+    pub download_dir: String,
     pub connections: usize,
     pub jobs: usize,
     pub limit: String,
@@ -45,8 +44,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            temp_dir: "./downloads".into(),
-            final_dir: "./library".into(),
+            download_dir: "./downloads".into(),
             connections: 2,
             jobs: 2,
             limit: String::new(),
@@ -63,7 +61,7 @@ pub struct Config {
     /// 别名 → 服务器配置。BTreeMap 保证输出顺序稳定。
     #[serde(default)]
     pub servers: BTreeMap<String, Profile>,
-    /// 交互模式下载设置（输出目录、并发、限速等），与登录信息分开保存。
+    /// 交互模式下载设置（下载文件夹、并发、限速等），与登录信息分开保存。
     #[serde(default)]
     pub settings: Settings,
 }
@@ -118,9 +116,15 @@ impl Config {
             },
             None => {
                 if self.servers.is_empty() {
-                    bail!("尚未登录任何服务器；请先运行 embydown login --server <URL> --user <账号> --password <密码>");
+                    bail!(
+                        "尚未登录任何服务器；请先运行 embydown login --server <URL> --user <账号> --password <密码>"
+                    );
                 }
-                Ok(self.servers.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                Ok(self
+                    .servers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect())
             }
         }
     }
@@ -205,8 +209,7 @@ pub fn edit<T>(f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
     let path = path()?;
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
     let _file_lock = acquire_file_lock(dir);
     let mut cfg = load_from(&path)?.unwrap_or_default();
     let out = f(&mut cfg)?;
@@ -226,8 +229,7 @@ fn write_atomic(path: &Path, cfg: &Config) -> Result<()> {
 /// （包括 login）都会“解析配置失败”。队列与历史记录也复用这里。
 pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("创建目录失败: {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("创建目录失败: {}", dir.display()))?;
     }
     let tmp = tmp_path(path);
     let result = (|| -> Result<()> {
@@ -242,8 +244,7 @@ pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
         // 已存在的文件可能权限更宽，统一收紧到 0600
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("保存文件失败: {}", path.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("保存文件失败: {}", path.display()))?;
         // 让 rename 本身也落盘（目录项）。
         if let Some(dir) = path.parent()
             && let Ok(d) = std::fs::File::open(dir)
@@ -289,9 +290,7 @@ fn acquire_file_lock(dir: &Path) -> FileLock {
         {
             Ok(mut f) => {
                 let _ = write!(f, "{}", std::process::id());
-                return FileLock {
-                    path: Some(lock),
-                };
+                return FileLock { path: Some(lock) };
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if lock_is_stale(&lock) {
@@ -383,27 +382,32 @@ mod tests {
     #[test]
     fn settings_round_trip_and_defaults_for_legacy_config() {
         let mut cfg = Config::default();
-        cfg.settings.temp_dir = "/media/downloads".into();
+        cfg.settings.download_dir = "/media/downloads".into();
         cfg.settings.jobs = 4;
         cfg.settings.subs = false;
         let text = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.settings.temp_dir, "/media/downloads");
+        assert_eq!(back.settings.download_dir, "/media/downloads");
         assert_eq!(back.settings.jobs, 4);
         assert!(!back.settings.subs);
 
         // 旧配置文件（只有 servers）读出来时，设置回落到默认值。
         let legacy: Config = serde_json::from_str(r#"{"servers":{}}"#).unwrap();
-        assert_eq!(legacy.settings.temp_dir, "./downloads");
+        assert_eq!(legacy.settings.download_dir, "./downloads");
         assert_eq!(legacy.settings.connections, 2);
         assert_eq!(legacy.settings.jobs, 2);
         assert!(legacy.settings.resume);
 
-        // 旧配置里的 out 键迁移到 temp_dir。
+        // 旧配置里的 out / temp_dir 键迁移到 download_dir；final_dir 被忽略。
         let old_key: Config =
             serde_json::from_str(r#"{"settings":{"out":"/old/downloads"}}"#).unwrap();
-        assert_eq!(old_key.settings.temp_dir, "/old/downloads");
-        assert_eq!(old_key.settings.final_dir, "./library");
+        assert_eq!(old_key.settings.download_dir, "/old/downloads");
+
+        let old_dirs: Config = serde_json::from_str(
+            r#"{"settings":{"temp_dir":"/old/downloads","final_dir":"/old/library"}}"#,
+        )
+        .unwrap();
+        assert_eq!(old_dirs.settings.download_dir, "/old/downloads");
     }
 
     #[test]
